@@ -3,10 +3,11 @@ pandas==2.2.3
 numpy==2.1.2
 
 supabase==2.4.0
-gotrue==2.6.1
+# Laisser supabase tirer ses deps, mais on épingle celles-ci pour compatibilité:
+httpx==0.25.2         # < 0.26 requis par supabase 2.4.0
+realtime==1.0.2       # < 2.0 requis par supabase 2.4.0
 postgrest==0.13.2
-realtime==2.0.2
+gotrue==2.6.1
 storage3==0.7.3
-httpx==0.27.2
 
 python-dotenv==1.0.1
