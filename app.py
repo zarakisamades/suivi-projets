@@ -20,16 +20,15 @@ st.write("SUPABASE_URL:", (url[:50] + "...") if url else "❌ manquant")
 st.write("SUPABASE_ANON_KEY:", "✅ présent" if key else "❌ manquant")
 
 # 3) DNS + reachability Supabase
+# 3) DNS + reachability Supabase
 if url:
+    import httpx
     try:
-        host = url.replace("https://","").replace("http://","").split("/")[0]
-        st.write("DNS:", host, "→", socket.gethostbyname(host))
-        import httpx
-        r = httpx.get(url + "/auth/v1/health", timeout=10.0)
-        st.write("Auth health:", r.status_code, r.text[:120])
+        r = httpx.get(url + "/rest/v1/", timeout=5.0)
+        st.success(f"Connexion réseau Supabase OK ✅ (status: {r.status_code})")
     except Exception as e:
-        st.error(f"Network check error: {e}")
-        st.code(traceback.format_exc())
+        st.error(f"Erreur réseau vers Supabase : {e}")
+
 
 # 4) Import du client Supabase
 try:
