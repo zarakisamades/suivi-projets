@@ -1,8 +1,7 @@
 streamlit==1.38.0
-pandas==2.2.2
-numpy==1.26.4
+pandas==2.2.3
+numpy==2.1.2
 
-# Client Supabase (v2) + dépendances réseau
 supabase==2.4.0
 gotrue==2.6.1
 postgrest==0.13.2
