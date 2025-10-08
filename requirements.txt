@@ -1,4 +1,9 @@
 streamlit==1.38.0
-supabase==2.6.0
-pandas==2.2.2
-python-dotenv==1.0.1
+pandas
+numpy
+supabase
+python-dotenv
+gotrue
+postgrest
+storage3
+realtime
