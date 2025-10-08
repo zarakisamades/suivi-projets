@@ -1,9 +1,13 @@
 streamlit==1.38.0
-pandas
-numpy
-supabase
-python-dotenv
-gotrue
-postgrest
-storage3
-realtime
+pandas==2.2.2
+numpy==1.26.4
+
+# Client Supabase (v2) + dépendances réseau
+supabase==2.4.0
+gotrue==2.6.1
+postgrest==0.13.2
+realtime==2.0.2
+storage3==0.7.3
+httpx==0.27.2
+
+python-dotenv==1.0.1
