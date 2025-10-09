@@ -266,7 +266,7 @@ def main():
     # Deux mises en page : sans colonne gauche si connecté
     if st.session_state["user"] is None:
         try:
-            col_auth, col_app = st.columns([1, 2], gap="large", vertical_alignment="start")
+            col_auth, col_app = st.columns([1, 2], gap="large")
         except TypeError:
             col_auth, col_app = st.columns([1, 2], gap="large")
     else:
