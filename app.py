@@ -263,6 +263,82 @@ def page_nouvelle_mise_a_jour(sb: Client, user_id: str):
         st.rerun()
 
     st.markdown("#### PV déjà uploadés")
+    # ========= HISTORIQUE COMPLET LEGACY (project_pv_log) =========
+# A coller à la fin de page_nouvelle_mise_a_jour(sb, user_id), après la section PV existante.
+
+def _pick_first(d, candidates, default=None):
+    """Retourne la première clé existante dans d parmi 'candidates'."""
+    for k in candidates:
+        if k in d and d[k] is not None:
+            return d[k]
+    return default
+
+def fetch_pv_log_rows(sb: Client, project_id: str, limit: int = 200):
+    """
+    Lit la table legacy project_pv_log (renommée depuis 'suivi des PV')
+    et tente de normaliser les champs essentiels.
+    """
+    try:
+        # On récupère "toutes colonnes" pour s'adapter aux noms
+        q = sb.table("project_pv_log").select("*").eq("project_id", project_id).order("uploaded_at", desc=True)
+        try:
+            rows = q.limit(limit).execute().data or []
+        except Exception:
+            # Si la colonne uploaded_at n’existe pas, on tente created_at
+            q = sb.table("project_pv_log").select("*").eq("project_id", project_id).order("created_at", desc=True)
+            rows = q.limit(limit).execute().data or []
+    except Exception as e:
+        st.info("Aucun historique legacy (project_pv_log) détecté ou accès refusé.")
+        return []
+
+    norm = []
+    for r in rows:
+        # Détecte les noms des colonnes
+        file_path = _pick_first(r, ["file_path", "storage_path", "path", "object_path"])
+        file_name = _pick_first(r, ["file_name", "original_name", "name", "title"], default="PV_chantier.pdf")
+        ts       = _pick_first(r, ["uploaded_at", "created_at", "date", "ts"])
+
+        if not file_path:
+            # Si on ne trouve aucun chemin, on ignore cette ligne (non cliquable)
+            continue
+
+        # URL signée temporaire
+        try:
+            signed = sb.storage.from_(BUCKET_PV).create_signed_url(file_path, 3600)
+            url = signed.get("signedURL") or signed.get("signed_url")
+        except Exception:
+            url = None
+
+        norm.append({
+            "file_name": file_name,
+            "uploaded_at": ts,
+            "url": url,
+            "file_path": file_path
+        })
+    return norm
+
+with st.expander("🗂️ Historique complet des PV (source legacy `project_pv_log`)", expanded=False):
+    legacy = fetch_pv_log_rows(sb, project_id, limit=200)
+    if not legacy:
+        st.caption("Aucun enregistrement legacy trouvé pour ce projet.")
+    else:
+        for item in legacy:
+            if item["url"]:
+                st.markdown(
+                    f"- **[{item['file_name']}]({item['url']})**  \n"
+                    f"  _Uploadé le : {item['uploaded_at']}_  \n"
+                    f"  <span style='opacity:0.6'>({item['file_path']})</span>",
+                    unsafe_allow_html=True
+                )
+            else:
+                # Fallback si pas d’URL signée possible
+                st.markdown(
+                    f"- **{item['file_name']}**  \n"
+                    f"  _Uploadé le : {item['uploaded_at']}_  \n"
+                    f"  <span style='opacity:0.6'>Chemin : {item['file_path']}</span>",
+                    unsafe_allow_html=True
+                )
+
     pv_list = list_signed_pv(sb, project_id, expires_sec=3600)
     if not pv_list:
         st.info("Aucun PV trouvé pour ce projet.")
