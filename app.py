@@ -1,212 +1,133 @@
-# app.py
-from __future__ import annotations
-
-import os
-import socket
-from datetime import date
-from typing import Optional
-
+# =========================
+# PV DE CHANTIER (upload + listing)
+# A placer dans la page "Nouvelle mise à jour"
+# =========================
+from datetime import datetime
+import re
+import mimetypes
 import streamlit as st
-from supabase import create_client, Client
 
+BUCKET_PV = "pv-chantier"
 
-# -----------------------------
-# Config de page
-# -----------------------------
-st.set_page_config(page_title="Suivi d’avancement — Saisie hebdomadaire", page_icon="📈", layout="centered")
-st.title("Suivi d’avancement — Saisie hebdomadaire")
+def _safe_filename(name: str) -> str:
+    # Nettoyer un peu
+    base = re.sub(r"\s+", "_", name.strip())
+    base = re.sub(r"[^A-Za-z0-9._-]", "", base)
+    return base or f"pv_{int(datetime.utcnow().timestamp())}.pdf"
 
+def upload_pv_file(sb, project_id, file_obj):
+    """Upload 1 fichier dans Storage + insert metadata dans public.project_pv"""
+    # Chemin = {project_id}/{YYYY}/{YYYY-MM-DD_HH-mm-ss}_{nom}
+    now = datetime.utcnow()
+    ts = now.strftime("%Y-%m-%d_%H-%M-%S")
+    fname = _safe_filename(file_obj.name)
+    path = f"{project_id}/{now.year}/{ts}_{fname}"
 
-# -----------------------------
-# Accès Supabase (mis en cache)
-# -----------------------------
-@st.cache_resource(show_spinner=False)
-def get_supabase() -> Client:
-    url = os.getenv("SUPABASE_URL", "")
-    key = os.getenv("SUPABASE_ANON_KEY", "")
-    if not url or not key:
-        raise RuntimeError("Variables d’environnement SUPABASE_URL / SUPABASE_ANON_KEY manquantes.")
-    return create_client(url, key)
+    # Déterminer le MIME
+    mime = getattr(file_obj, "type", None) or mimetypes.guess_type(fname)[0] or "application/octet-stream"
 
+    # Upload (no upsert)
+    up = sb.storage.from_(BUCKET_PV).upload(
+        path=path,
+        file=file_obj.getvalue(),  # Streamlit UploadedFile
+        file_options={"content-type": mime, "upsert": False},
+    )
+    if isinstance(up, dict) and up.get("error"):
+        raise RuntimeError(f"Erreur upload: {up['error'].get('message', up['error'])}")
 
-def get_user_id(sb: Client) -> Optional[str]:
-    """Retourne l'UUID de l'utilisateur connecté (ou None)."""
-    try:
-        u = sb.auth.get_user()
-        # Structure: object avec .user.id (supabase-py v2)
-        return getattr(getattr(u, "user", None), "id", None)
-    except Exception:
-        return None
+    # Insert metadata
+    ins = sb.table("project_pv").insert({
+        "project_id": project_id,
+        "file_path": path,
+        "file_name": file_obj.name,
+        "mime_type": mime,
+    }).execute()
+    if ins.error:
+        raise RuntimeError(f"Erreur DB: {ins.error.message}")
 
-
-# -----------------------------
-# Healthcheck rapide
-# -----------------------------
-def healthcheck(sb: Client):
-    url = os.getenv("SUPABASE_URL", "")
-    host = url.replace("https://", "").replace("http://", "").split("/")[0] if url else ""
-    try:
-        ip = socket.gethostbyname(host)
-        st.success(f"Connexion réseau Supabase OK (status attendu: 401) — DNS {host} → {ip}")
-    except Exception as e:
-        st.error(f"DNS échec : {e}")
-
-    # Import/initialisation
-    try:
-        _ = sb.auth  # accès simple
-        st.success("Import et initialisation de Supabase OK")
-    except Exception as e:
-        st.error(f"Erreur initialisation Supabase : {e}")
-
-
-# -----------------------------
-# UI Auth
-# -----------------------------
-def auth_panel(sb: Client):
-    """Colonne gauche : connexion / création de compte."""
-    with st.sidebar:
-        st.header("Connexion")
-        mode = st.radio("",
-                        options=("Se connecter", "Créer un compte"),
-                        index=0,
-                        label_visibility="collapsed")
-
-        email = st.text_input("Email", value="", placeholder="email@domaine.com")
-        pwd = st.text_input("Mot de passe", value="", type="password")
-
-        if mode == "Se connecter":
-            if st.button("Connexion", use_container_width=True):
-                try:
-                    sb.auth.sign_in_with_password({"email": email, "password": pwd})
-                    st.session_state["user_id"] = get_user_id(sb)
-                    if st.session_state["user_id"]:
-                        st.toast("Connecté ✅", icon="✅")
-                        st.rerun()
-                    else:
-                        st.error("Échec de connexion : vérifie ton email (confirmé ?) et ton mot de passe.")
-                except Exception as e:
-                    st.error(f"Échec de connexion : {getattr(e, 'message', str(e))}")
-
-        else:  # Créer un compte
-            if st.button("Créer mon compte", use_container_width=True):
-                try:
-                    sb.auth.sign_up({"email": email, "password": pwd})
-                    st.success("Compte créé ! Vérifie ton email et clique sur le lien de confirmation, puis reviens te connecter.")
-                except Exception as e:
-                    st.error(f"Échec de création : {getattr(e, 'message', str(e))}")
-
-        # Zone compte
-        st.divider()
-        uid = st.session_state.get("user_id")
-        if uid:
-            st.caption(f"Connecté : {sb.auth.get_user().user.email}")
-            if st.button("Se déconnecter", use_container_width=True):
-                try:
-                    sb.auth.sign_out()
-                finally:
-                    st.session_state.pop("user_id", None)
-                    st.rerun()
-
-
-# -----------------------------
-# Contenu principal connecté
-# -----------------------------
-def app_connected(sb: Client, user_id: str):
-    st.subheader("Nouvelle mise à jour")
-
-    # Charger la liste des projets
-    try:
-        proj_res = sb.table("projects").select("id,name").order("name").execute()
-        projects = proj_res.data or []
-    except Exception as e:
-        st.error(f"Erreur lecture projets : {e}")
-        projects = []
-
-    if not projects:
-        st.info("Aucun projet trouvé dans la table **projects**.")
-        return
-
-    names = [p["name"] for p in projects]
-    selected = st.selectbox("Projet", names)
-    project_id = next((p["id"] for p in projects if p["name"] == selected), None)
-
-    col1, col2 = st.columns(2)
-    with col1:
-        progress_travaux = st.number_input("Progression travaux (%)", min_value=0.0, max_value=100.0, value=0.0, step=1.0)
-    with col2:
-        progress_paiements = st.number_input("Progression paiements (%)", min_value=0.0, max_value=100.0, value=0.0, step=1.0)
-
-    pv_date = st.date_input("PV chantier (date)", value=date.today())
-    commentaires = st.text_area("Commentaires (facultatif)", placeholder="Observations, risques, actions…")
-
-    if st.button("Enregistrer la mise à jour", type="primary"):
-        try:
-            payload = {
-                "project_id": project_id,
-                "updated_by": user_id,              # RLS: with check auth.uid() = updated_by
-                "progress_travaux": progress_travaux,
-                "progress_paiements": progress_paiements,
-                "pv_chantier": pv_date.isoformat(),
-                "commentaires": commentaires or None,
-            }
-            sb.table("project_updates").insert(payload).execute()
-            st.success("Mise à jour enregistrée ✅")
-        except Exception as e:
-            st.error(f"Échec d’insertion : {getattr(e, 'message', str(e))}")
-
-    st.divider()
-    st.subheader("Mes dernières saisies")
-    try:
-        upd = (
-            sb.table("project_updates")
-            .select("created_at, progress_travaux, progress_paiements, commentaires")
-            .eq("updated_by", user_id)
-            .order("created_at", desc=True)
-            .limit(5)
+def list_signed_pv(sb, project_id, expires_sec=3600):
+    """Retourne la liste des PV (dict) avec URL signée temporaire."""
+    sel = sb.table("project_pv")\
+            .select("*")\
+            .eq("project_id", project_id)\
+            .order("uploaded_at", desc=True)\
             .execute()
-        )
-        rows = upd.data or []
-        if not rows:
-            st.caption("Aucune saisie trouvée.")
-        else:
-            for r in rows:
-                st.write(
-                    f"- **{r['created_at']}** — travaux {r['progress_travaux']}%, paiements {r['progress_paiements']}%  \n"
-                    f"  {r.get('commentaires') or ''}"
-                )
-    except Exception as e:
-        st.error(f"Erreur lecture mises à jour : {e}")
+    if sel.error:
+        st.error(f"Erreur lecture PV: {sel.error.message}")
+        return []
+
+    out = []
+    for r in sel.data:
+        signed = sb.storage.from_(BUCKET_PV).create_signed_url(r["file_path"], expires_sec)
+        url = signed.get("signedURL") or signed.get("signed_url")
+        out.append({
+            "file_name": r["file_name"],
+            "uploaded_at": r["uploaded_at"],
+            "url": url,
+        })
+    return out
 
 
-# -----------------------------
-# Main
-# -----------------------------
-def main():
-    try:
-        sb = get_supabase()
-    except Exception as e:
-        st.error(str(e))
-        return
+# -------------------------
+# UI : section PV de chantier
+# -------------------------
+st.subheader("📎 PV de chantier (PDF / DOCX)")
 
-    # Bandeaux de contrôle
-    healthcheck(sb)
+# Si tu as déjà le project_id sélectionné plus haut, remplace cette partie :
+# ------------------------------------------------------------------------
+# Sélection (fallback) si tu n'as PAS déjà la variable project_id
+projects_q = sb.table("projects").select("id,name").order("name").execute()
+projects = projects_q.data or []
+project_labels = {p["name"]: p["id"] for p in projects}
+if not projects:
+    st.info("Aucun projet trouvé. Ajoute un projet avant d’uploader des PV.")
+    selected_project_id = None
+else:
+    selected_name = st.selectbox("Projet", list(project_labels.keys()), index=0, key="pv_select_project")
+    selected_project_id = project_labels[selected_name]
+# ------------------------------------------------------------------------
+# Si tu as déjà `project_id` dans ta page, fais simplement :
+# selected_project_id = project_id
 
-    # Colonne auth (sidebar)
-    auth_panel(sb)
+# Uploader
+col1, col2 = st.columns([2,1])
+with col1:
+    files = st.file_uploader(
+        "Dépose un ou plusieurs fichiers",
+        type=["pdf", "doc", "docx"],
+        accept_multiple_files=True
+    )
+with col2:
+    st.write("")  # espace
+    can_upload = st.button("Uploader les PV", use_container_width=True, disabled=not (files and selected_project_id))
 
-    # Corps principal
-    user_id = st.session_state.get("user_id") or get_user_id(sb)
-    if user_id and user_id != st.session_state.get("user_id"):
-        st.session_state["user_id"] = user_id  # synchronise
+if can_upload and selected_project_id:
+    ok, ko = 0, 0
+    with st.spinner("Upload en cours..."):
+        for f in files:
+            try:
+                upload_pv_file(sb, selected_project_id, f)
+                ok += 1
+            except Exception as e:
+                ko += 1
+                st.error(str(e))
+    if ok:
+        st.success(f"{ok} fichier(s) uploadé(s) ✔️")
+    if ko:
+        st.warning(f"{ko} fichier(s) en erreur ⚠️")
+    st.rerun()
 
-    st.write("")  # espacement
-    if not user_id:
-        st.info("Connecte-toi pour saisir une mise à jour.")
-        return
-
-    # Afficher l’app connectée
-    app_connected(sb, user_id)
-
-
-if __name__ == "__main__":
-    main()
+# Liste des PV déjà uploadés (liens signés)
+st.markdown("#### PV déjà uploadés")
+if selected_project_id:
+    pv_list = list_signed_pv(sb, selected_project_id, expires_sec=3600)
+    if not pv_list:
+        st.info("Aucun PV trouvé pour ce projet.")
+    else:
+        for item in pv_list:
+            # Affichage : Nom cliquable + date
+            st.markdown(
+                f"- **[{item['file_name']}]({item['url']})**  \n"
+                f"  _Uploadé le : {item['uploaded_at']}_",
+                unsafe_allow_html=True
+            )
