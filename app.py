@@ -265,7 +265,10 @@ def render_auth_panel() -> None:
 def main():
     # Deux mises en page : sans colonne gauche si connecté
     if st.session_state["user"] is None:
-        col_auth, col_app = st.columns([0.9, 1.6], vertical_alignment="start")
+        try:
+            col_auth, col_app = st.columns([1, 2], gap="large", vertical_alignment="start")
+        except TypeError:
+            col_auth, col_app = st.columns([1, 2], gap="large")
     else:
         col_app = st.container()
         col_auth = None
