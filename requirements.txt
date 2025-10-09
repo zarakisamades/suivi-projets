@@ -2,10 +2,10 @@ streamlit==1.38.0
 pandas==2.2.3
 numpy==2.1.2
 
+# Supabase et dépendances compatibles Python 3.13
 supabase==2.4.0
-# Laisser supabase tirer ses deps, mais on épingle celles-ci pour compatibilité:
-httpx==0.25.2         # < 0.26 requis par supabase 2.4.0
-realtime==1.0.2       # < 2.0 requis par supabase 2.4.0
+httpx==0.25.2
+realtime==1.0.2
 postgrest==0.13.2
 gotrue==2.6.1
 storage3==0.7.3
