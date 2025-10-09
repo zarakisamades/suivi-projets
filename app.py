@@ -1,4 +1,19 @@
 # app.py
+# ---- Session state par défaut (à mettre tôt dans app.py, après les imports) ----
+import uuid
+
+for k, v in {
+    "user": None,                          # objet utilisateur supabase ou None
+    "auth_panel_visible": True,            # contrôle d'affichage du panneau d'auth
+    "selected_project_id": None,           # id projet sélectionné
+    "uploader_version": 0,                 # sert à vider le file_uploader
+    "form_progress_travaux": None,         # champs de saisie
+    "form_progress_paiements": None,
+    "form_date_pv": None,
+    "form_commentaires": "",
+}.items():
+    st.session_state.setdefault(k, v)
+
 import os, socket, traceback, platform, uuid, datetime as dt
 import streamlit as st
 from typing import List, Dict, Any, Optional
