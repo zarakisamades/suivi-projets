@@ -1,4 +1,7 @@
 # app.py
+
+import os, socket, traceback, platform, uuid, datetime as dt
+import streamlit as st
 # ---- Session state par défaut (à mettre tôt dans app.py, après les imports) ----
 import uuid
 
@@ -13,9 +16,6 @@ for k, v in {
     "form_commentaires": "",
 }.items():
     st.session_state.setdefault(k, v)
-
-import os, socket, traceback, platform, uuid, datetime as dt
-import streamlit as st
 from typing import List, Dict, Any, Optional
 
 # ------------ Config page ------------
