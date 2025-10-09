@@ -298,7 +298,7 @@ with col_main:
             # colonnes existantes de ta table project_updates
             "id": str(uuid.uuid4()),
             "project_id": project_id,
-            "updated_by": None,  # si tu stockes l'id utilisateur supabase, adapte ici
+            "updated_by": st.session_state.user.id,  # si tu stockes l'id utilisateur supabase, adapte ici
             "progress_travaux": prog_t,
             "progress_paiements": prog_p,
             "pv_chantier": pv_date.isoformat() if pv_date else None,
