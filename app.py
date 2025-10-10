@@ -221,10 +221,11 @@ def ui_auth_panel():
 
 # --------------- Sélection de projet ---------------------
 def on_project_change():
-    # Nettoie l'état AVANT de redessiner les widgets + vide l’uploader
+    """Réinitialise l’état des champs quand le projet change."""
     reset_form_state()
     st.session_state["uploader_version"] = st.session_state.get("uploader_version", 0) + 1
-    st.rerun()
+    # pas besoin de st.rerun() ici, Streamlit le fait déjà automatiquement
+
 
 def ui_project_selector(projects: List[Dict[str, Any]]):
     if not projects:
