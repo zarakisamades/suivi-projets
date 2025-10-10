@@ -339,7 +339,7 @@ def main():
                 st.date_input( "Date du PV de chantier (optionnel)",
                     key="form_date_pv",
                               value=None if "form_date_pv" not in st.session_state else st.session_state["form_date_pv"])
-                )
+                
 
             com = st.text_area(
                 "Commentaires",
