@@ -336,10 +336,9 @@ def main():
 
             c3, = st.columns([1])
             with c3:
-                d = st.date_input(
-                    "Date du PV de chantier (optionnel)",
-                    value=st.session_state["form_date_pv"] or date.today(),
+                st.date_input( "Date du PV de chantier (optionnel)",
                     key="form_date_pv",
+                              value=None if "form_date_pv" not in st.session_state else st.session_state["form_date_pv"])
                 )
 
             com = st.text_area(
