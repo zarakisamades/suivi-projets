@@ -1,444 +1,421 @@
-# app.py
+# app.py — Partie 1/2
 
 import os
 import socket
 import platform
-from datetime import date, datetime
-from typing import Optional, List, Dict
+import traceback
+import uuid
+import mimetypes
+from datetime import datetime, date
+from typing import List, Dict, Optional, Tuple
 
 import streamlit as st
-import pandas as pd
 from supabase import create_client, Client
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Configuration page
-# ──────────────────────────────────────────────────────────────────────────────
+
+# ---------------- Config page ----------------
 st.set_page_config(
     page_title="Suivi d’avancement — Saisie hebdomadaire",
-    page_icon="📈",
+    page_icon="🗂️",
     layout="wide",
 )
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Constantes de l'appli
-# ──────────────────────────────────────────────────────────────────────────────
-BUCKET_PV = "pv-chantier"
+
+# ---------------- Constantes ----------------
+BUCKET_PV = "pv-chantier"          # bucket public (lecture libre)
 MAX_UPLOAD_MB = 200
 ALLOWED_EXT = {".pdf", ".docx", ".doc"}
-SIGNED_URL_TTL = 60 * 60  # 1h
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Session state (défauts)
-# ──────────────────────────────────────────────────────────────────────────────
-DEFAULT_STATE = {
-    "user": None,                     # objet user GoTrue
-    "selected_project_id": None,      # uuid projet sélectionné
-    "form_progress_travaux": 0.0,     # champs du formulaire
-    "form_progress_paiements": 0.0,
-    "form_commentaires": "",
-    "form_date_pv": None,             # None | date
-}
 
-for k, v in DEFAULT_STATE.items():
-    if k not in st.session_state:
-        st.session_state[k] = v
+# ---------------- Supabase ----------------
+def get_env(name: str, default: str = "") -> str:
+    val = os.getenv(name, default).strip()
+    return val
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Supabase
-# ──────────────────────────────────────────────────────────────────────────────
+
 @st.cache_resource(show_spinner=False)
 def get_supabase() -> Client:
-    url = os.environ.get("SUPABASE_URL", "").strip()
-    key = os.environ.get("SUPABASE_ANON_KEY", "").strip()
+    url = get_env("SUPABASE_URL")
+    key = get_env("SUPABASE_ANON_KEY")
     if not url or not key:
-        raise RuntimeError(
-            "Variables d’environnement SUPABASE_URL / SUPABASE_ANON_KEY manquantes."
-        )
+        st.stop()
     return create_client(url, key)
 
-def check_dns(url: str) -> str:
+
+# ---------------- Réseau / DNS ----------------
+def dns_ok(hostname: str) -> Tuple[bool, str]:
     try:
-        host = url.split("://", 1)[-1].split("/", 1)[0]
-        ip = socket.gethostbyname(host)
-        return f"Connexion réseau Supabase OK (status attendu: 401) — DNS {host} → {ip}"
+        ip = socket.gethostbyname(hostname)
+        return True, ip
     except Exception as e:
-        return f"DNS KO: {e}"
+        return False, f"{type(e).__name__}: {e}"
 
-sb: Client = get_supabase()
-st.success(check_dns(sb.rest_url))
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Data helpers
-# ──────────────────────────────────────────────────────────────────────────────
+def render_dns_banner():
+    url = get_env("SUPABASE_URL")
+    host = ""
+    try:
+        # ex: https://kwgqaudyirdesedaxrld.supabase.co
+        host = url.split("//", 1)[1].split("/", 1)[0]
+    except Exception:
+        pass
+
+    ok, info = dns_ok(host) if host else (False, "URL Supabase invalide")
+    if ok:
+        st.success(
+            f"Connexion réseau Supabase OK (status attendu: 401) — DNS {host} → {info}",
+            icon="✅",
+        )
+    else:
+        st.error(f"DNS échec : {info}", icon="❌")
+
+
+# ---------------- Auth ----------------
+def login_panel(sb: Client) -> Optional[Dict]:
+    st.subheader("Connexion")
+    mode = st.radio(
+        " ",
+        ["Se connecter", "Créer un compte"],
+        horizontal=False,
+        index=0,
+        label_visibility="collapsed",
+        key="auth_mode_radio",
+    )
+
+    email = st.text_input("Email", key="auth_email")
+    password = st.text_input("Mot de passe", type="password", key="auth_pwd")
+
+    colb1, colb2 = st.columns([1, 1])
+    with colb1:
+        if st.button("Connexion") and mode == "Se connecter":
+            try:
+                res = sb.auth.sign_in_with_password({"email": email, "password": password})
+                st.session_state["user"] = res.user
+            except Exception as e:
+                st.error(f"Échec de connexion : {e}")
+    with colb2:
+        if st.button("Créer le compte") and mode == "Créer un compte":
+            try:
+                sb.auth.sign_up({"email": email, "password": password})
+                st.info("Compte créé. Vérifie ton email, puis connecte-toi.")
+            except Exception as e:
+                st.error(f"Échec de création du compte : {e}")
+
+    user = st.session_state.get("user")
+    return user
+
+
+def header_user(sb: Client, user: Dict):
+    st.caption(f"Connecté : {user.get('email')}")
+    if st.button("Se déconnecter"):
+        try:
+            sb.auth.sign_out()
+        except Exception:
+            pass
+        st.session_state.pop("user", None)
+        st.rerun()
+
+
+# ---------------- Projets ----------------
 def list_projects(sb: Client) -> List[Dict]:
-    """Retourne [{id,name}] triés par name."""
+    """Retourne les projets visibles pour l'utilisateur courant (table 'projects')."""
     try:
-        data = sb.table("projects").select("id,name").order("name").execute()
-        return data.data or []
+        res = sb.table("projects").select("id, name").order("name").execute()
+        return res.data or []
     except Exception as e:
-        st.error(f"Erreur lecture projets : {e}")
+        st.warning(f"Aucun projet trouvé (ou erreur). Détails : {e}")
         return []
 
-def insert_project_update(
+
+# ---------------- Fichiers / Storage ----------------
+def _safe_filename(original_name: str) -> str:
+    # Normalise le nom pour éviter caractères problématiques
+    base = os.path.basename(original_name or "").replace(" ", "_")
+    base = "".join(c for c in base if c.isalnum() or c in ("_", "-", ".", "(", ")"))
+    if not base:
+        base = "document"
+    # préfix UUID pour éviter les collisions
+    return f"{uuid.uuid4().hex}_{base}"
+
+
+def _content_type_from_name(name: str) -> str:
+    ct, _ = mimetypes.guess_type(name)
+    return ct or "application/octet-stream"
+
+
+def upload_pv_files(
+    sb: Client,
+    project_id: str,
+    files: List["UploadedFile"],
+    pv_date: Optional[date],
+) -> Tuple[int, List[str]]:
+    """
+    Upload les fichiers vers: pv-chantier/<project_id>/<YYYYMMDD>/<filename>
+    Retourne: (nb_upload_ok, messages)
+    """
+    msgs: List[str] = []
+    if not files:
+        return 0, msgs
+
+    store = sb.storage.from_(BUCKET_PV)
+    d_folder = (pv_date or date.today()).strftime("%Y%m%d")
+
+    ok_count = 0
+    for f in files:
+        ext = os.path.splitext(f.name)[1].lower()
+        if ext not in ALLOWED_EXT:
+            msgs.append(f"⛔ {f.name} : extension non autorisée.")
+            continue
+        if f.size and (f.size > MAX_UPLOAD_MB * 1024 * 1024):
+            msgs.append(f"⛔ {f.name} : taille > {MAX_UPLOAD_MB} MB.")
+            continue
+
+        safe_name = _safe_filename(f.name)
+        obj_path = f"{project_id}/{d_folder}/{safe_name}"
+        try:
+            data = f.read()  # bytes
+            ctype = _content_type_from_name(f.name)
+            store.upload(
+                obj_path,
+                data,
+                file_options={"content-type": ctype, "upsert": False},
+            )
+            msgs.append(f"✅ {f.name} déposé.")
+            ok_count += 1
+        except Exception as e:
+            msgs.append(f"⚠️ {f.name} : upload échoué ({e})")
+
+    return ok_count, msgs
+
+
+def list_public_pv(sb: Client, project_id: str) -> List[Dict]:
+    """
+    Liste tous les PV pour un projet, renvoie:
+    { 'date_folder': 'YYYYMMDD', 'file_name': 'xx.pdf', 'url': '<public-url>', 'uploaded_at': ISO }
+    ATTENTION: bucket public requis (policy de lecture).
+    """
+    store = sb.storage.from_(BUCKET_PV)
+    out: List[Dict] = []
+
+    try:
+        # 1) lister les dossiers dates : <project_id>/
+        # la SDK retourne dossiers + fichiers; on va filtrer
+        entries = store.list(project_id)
+    except Exception as e:
+        st.error(f"Erreur lecture Storage (racine projet): {e}")
+        return out
+
+    # Sous-dossiers = dates (heuristique: item sans 'id' ou avec 'metadata' vide, et / pas dans le nom)
+    date_folders = [it["name"] for it in entries if "/" not in it.get("name", "")]
+    # tri desc
+    date_folders.sort(reverse=True)
+
+    for folder in date_folders:
+        prefix = f"{project_id}/{folder}"
+        try:
+            files = store.list(prefix)
+        except Exception as e:
+            st.warning(f"Erreur lecture Storage ({prefix}) : {e}")
+            continue
+
+        for item in files:
+            name = item.get("name", "")
+            if not name:
+                continue
+            obj_path = f"{prefix}/{name}"
+            # URL publique permanente :
+            pub = store.get_public_url(obj_path)
+            url = pub.get("publicURL") or pub.get("public_url") or ""
+            uploaded_at = (
+                item.get("updated_at")
+                or item.get("created_at")
+                or datetime.utcnow().isoformat()
+            )
+            out.append(
+                {
+                    "date_folder": folder,
+                    "file_name": name,
+                    "url": url,
+                    "uploaded_at": uploaded_at,
+                }
+            )
+
+    # déjà trié par dossiers desc; on peut raffiner par uploaded_at si besoin
+    return out
+# app.py — Partie 2/2
+
+# ---------------- Rendu Historique ----------------
+def render_pv_history(sb: Client, project_id: Optional[str]):
+    st.subheader("Pièces jointes — PV de chantier")
+    if not project_id:
+        st.info("Sélectionne un projet pour voir les PV.")
+        return
+
+    items = list_public_pv(sb, project_id)
+    if not items:
+        st.info("Aucun PV pour ce projet.")
+        return
+
+    # Groupement par date_folder
+    by_date: Dict[str, List[Dict]] = {}
+    for it in items:
+        by_date.setdefault(it["date_folder"], []).append(it)
+
+    # Affichage propre
+    for d in sorted(by_date.keys(), reverse=True):
+        st.markdown(f"### {d[:4]}-{d[4:6]}-{d[6:]}")
+        for it in by_date[d]:
+            nice_name = it["file_name"]
+            url = it["url"]
+            when = it["uploaded_at"]
+            st.markdown(f"- [{nice_name}]({url}) — ajouté le `{when}`")
+
+
+# ---------------- Enregistrement BDD ----------------
+def insert_update_row(
     sb: Client,
     project_id: str,
     progress_travaux: float,
     progress_paiements: float,
     commentaires: str,
     pv_date: Optional[date],
-) -> Optional[str]:
-    """Insère une ligne dans project_updates. Retourne id ou None."""
-    payload = {
+) -> bool:
+    """Insère une ligne dans project_updates (RLS doit permettre INSERT par l'utilisateur connecté)."""
+    row = {
         "project_id": project_id,
         "progress_travaux": progress_travaux,
-        "progress_paiements": progress_paiements,
-        "commentaires": commentaires or "",
+        "progress_paiments": progress_paiements,  # si ta colonne s'appelle progress_paiements, corrige ici
+        "commentaires": commentaires,
+        "pv_chantier": pv_date.isoformat() if pv_date else None,
     }
-    if pv_date:
-        payload["pv_chantier"] = pv_date.isoformat()
-
     try:
-        res = sb.table("project_updates").insert(payload).select("id").single().execute()
-        return (res.data or {}).get("id")
+        sb.table("project_updates").insert(row).execute()
+        return True
     except Exception as e:
         st.error(f"Erreur enregistrement mise à jour : {e}")
-        return None
+        return False
 
-def _safe_filename(name: str) -> str:
-    return (
-        name.replace("/", "_")
-        .replace("\\", "_")
-        .replace(":", "_")
-        .replace("?", "_")
-        .replace("#", "_")
-        .replace("%", "_")
-    )
 
-def upload_pv_files(sb: Client, project_id: str, files: List[st.runtime.uploaded_file_manager.UploadedFile]) -> int:
-    """Upload des fichiers dans pv-chantier/<project_id>/<YYYYMMDD>/..."""
-    if not files:
-        return 0
-
-    today_folder = datetime.utcnow().strftime("%Y%m%d")
-    ok_count = 0
-
-    store = sb.storage.from_(BUCKET_PV)
-
-    for f in files:
-        name = _safe_filename(f.name or "pv.pdf")
-        # extension check
-        ext = os.path.splitext(name)[1].lower()
-        if ext not in ALLOWED_EXT:
-            st.warning(f"{name} ignoré : extension non autorisée.")
-            continue
-
-        # taille (UploadedFile -> len = bytes)
-        size_mb = (f.size or 0) / (1024 * 1024)
-        if size_mb > MAX_UPLOAD_MB:
-            st.warning(f"{name} ignoré : {size_mb:.1f} Mo > {MAX_UPLOAD_MB} Mo.")
-            continue
-
-        # path final
-        uid = sb.auth.get_user().user.id if sb.auth.get_user() else "nouser"
-        path = f"{project_id}/{today_folder}/{uid}_{name}"
-
-        # upload (bytes)
-        try:
-            store.upload(path=path, file=f.getvalue(), file_options={"upsert": True, "content_type": f.type})
-            ok_count += 1
-        except Exception as e:
-            st.warning(f"Upload échoué pour {name} : {e}")
-
-    return ok_count
-
-def list_signed_pv(sb: Client, project_id: str, expires_sec: int = SIGNED_URL_TTL) -> List[Dict]:
-    """
-    Parcourt pv-chantier/<project_id>/ et génère des URLs signées.
-    Retourne [{file_name, url, uploaded_at}]
-    """
-    store = sb.storage.from_(BUCKET_PV)
-    out: List[Dict] = []
-
-    try:
-        # 1er niveau = jours (YYYYMMDD)
-        days = store.list(path=project_id)
-    except Exception as e:
-        st.error(f"Erreur lecture Storage : {e}")
-        return out
-
-    for d in days:
-        if d.get("id"):  # fichiers racine potentiels (on ignore)
-            continue
-        folder = d.get("name")
-        if not folder:
-            continue
-
-        try:
-            files = store.list(path=f"{project_id}/{folder}")
-        except Exception:
-            continue
-
-        for item in files:
-            if not item.get("name"):
-                continue
-            obj_path = f"{project_id}/{folder}/{item['name']}"
-            try:
-                signed = store.create_signed_url(obj_path, expires_sec)
-                url = signed.get("signedURL") or signed.get("signed_url") or signed.get("url") or ""
-            except Exception:
-                url = ""
-            out.append(
-                {
-                    "file_name": item["name"],
-                    "url": url,
-                    "uploaded_at": item.get("updated_at") or item.get("created_at") or datetime.utcnow().isoformat(),
-                }
-            )
-
-    # tri décroissant sur uploaded_at
-    def _dt(x):
-        try:
-            return pd.to_datetime(x)
-        except Exception:
-            return pd.Timestamp.min
-
-    out.sort(key=lambda r: _dt(r["uploaded_at"]), reverse=True)
-    return out
-
-# ──────────────────────────────────────────────────────────────────────────────
-# UI : Rendu lisible de l’historique
-# ──────────────────────────────────────────────────────────────────────────────
-def _shorten_name(name: str, max_len: int = 60) -> str:
-    if not isinstance(name, str):
-        return name
-    if len(name) <= max_len:
-        return name
-    keep = (max_len - 1) // 2
-    return f"{name[:keep]}…{name[-keep:]}"
-
-def render_pv_history(pv_list: List[Dict]):
-    st.subheader("Pièces jointes — PV de chantier")
-    if not pv_list:
-        st.info("Aucun PV pour ce projet.")
-        return
-
-    rows = []
-    now = datetime.utcnow()
-    for it in pv_list:
-        ts = it.get("uploaded_at")
-        try:
-            dtv = pd.to_datetime(ts)
-        except Exception:
-            dtv = pd.NaT
-        rows.append(
-            {
-                "Date": (dtv.date().isoformat() if pd.notna(dtv) else ""),
-                "Fichier": _shorten_name(it.get("file_name", "")),
-                "Ouvrir": it.get("url", ""),
-                "Ajouté le": (dtv.tz_localize(None).isoformat() if pd.notna(dtv) else ""),
-                "Lien valide ~jusqu’à": (now + pd.Timedelta(seconds=SIGNED_URL_TTL)).isoformat(),
-            }
-        )
-
-    df = pd.DataFrame(rows).sort_values(["Date", "Ajouté le"], ascending=[False, False])
-
-    for day, group in df.groupby("Date", sort=False):
-        with st.expander(day or "Date inconnue", expanded=True):
-            st.dataframe(
-                group[["Fichier", "Ouvrir", "Ajouté le", "Lien valide ~jusqu’à"]].reset_index(drop=True),
-                hide_index=True,
-                use_container_width=True,
-                column_config={
-                    "Fichier": st.column_config.TextColumn("Fichier", width="large"),
-                    "Ouvrir": st.column_config.LinkColumn("Lien", display_text="Ouvrir"),
-                    "Ajouté le": st.column_config.TextColumn("Ajouté le"),
-                    "Lien valide ~jusqu’à": st.column_config.TextColumn("Lien valide ~jusqu’à"),
-                },
-            )
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Auth très simple (email/password) – optionnel
-# ──────────────────────────────────────────────────────────────────────────────
-def auth_panel():
-    st.markdown("### Connexion")
-    mode = st.radio(" ", ["Se connecter", "Créer un compte"], horizontal=False, label_visibility="collapsed")
-
-    email = st.text_input("Email", value="")
-    pwd = st.text_input("Mot de passe", type="password", value="")
-
-    colA, colB = st.columns([1, 1])
-    with colA:
-        if st.button("Connexion", use_container_width=True, disabled=not email or not pwd):
-            try:
-                sb.auth.sign_in_with_password({"email": email, "password": pwd})
-                user = sb.auth.get_user().user
-                st.session_state.user = user
-                st.success(f"Connecté : {user.email}")
-                st.rerun()
-            except Exception as e:
-                st.error(f"Échec connexion : {e}")
-    with colB:
-        if st.button("Se déconnecter", use_container_width=True):
-            try:
-                sb.auth.sign_out()
-            except Exception:
-                pass
-            st.session_state.user = None
-            st.session_state.selected_project_id = None
-            st.rerun()
-
-    if mode == "Créer un compte":
-        st.write("— ou —")
-        new_email = st.text_input("Email (inscription)", value="", key="signup_email")
-        new_pwd = st.text_input("Mot de passe (min 6)", type="password", value="", key="signup_pwd")
-        if st.button("Créer mon compte", use_container_width=True, disabled=not new_email or not new_pwd):
-            try:
-                sb.auth.sign_up({"email": new_email, "password": new_pwd})
-                st.success("Compte créé. Vérifiez votre email puis connectez-vous.")
-            except Exception as e:
-                st.error(f"Échec de création du compte : {e}")
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Formulaire principal
-# ──────────────────────────────────────────────────────────────────────────────
+# ---------------- Panneau Formulaire ----------------
 def form_panel(sb: Client, projects: List[Dict]):
-    st.markdown("## Suivi d’avancement — Saisie")
+    st.header("Suivi d’avancement — Saisie")
 
-    # Sélecteur de projet
-    options = {p["name"]: p["id"] for p in projects}
-    if not options:
-        st.info("Aucun projet trouvé dans la table *projects*.")
+    if not projects:
+        st.info("Aucun projet disponible.")
         return
 
-    # valeur actuelle (si connue) pour le selectbox
-    current_id = st.session_state.get("selected_project_id")
-    initial_name = None
-    if current_id:
-        for p in projects:
-            if p["id"] == current_id:
-                initial_name = p["name"]
-                break
+    # Sélecteur projet
+    project_names = [p["name"] for p in projects]
+    project_ids = {p["name"]: p["id"] for p in projects}
 
-    sel_name = st.selectbox(
-        "Projet",
-        list(options.keys()),
-        index=(list(options.keys()).index(initial_name) if initial_name in options else 0),
-        key="ui_project_select",
+    sel_name = st.selectbox("Projet", project_names, key="sel_project_name")
+    project_id = project_ids.get(sel_name)
+
+    st.subheader("Nouvelle mise à jour")
+
+    # Champs de saisie
+    col1, col2 = st.columns(2)
+    with col1:
+        progress_travaux = st.number_input(
+            "Progression travaux (%)",
+            min_value=0.0,
+            max_value=100.0,
+            step=1.0,
+            value=0.0,
+            key="form_progress_travaux",
+        )
+    with col2:
+        progress_paiements = st.number_input(
+            "Progression paiements (%)",
+            min_value=0.0,
+            max_value=100.0,
+            step=1.0,
+            value=0.0,
+            key="form_progress_paiements",
+        )
+
+    pv_date: Optional[date] = st.date_input(
+        "Date du PV de chantier (optionnel)",
+        value=None,
+        format="YYYY/MM/DD",
+        key="form_date_pv",
     )
-    project_id = options[sel_name]
-    # met à jour l’état si change
-    if project_id != st.session_state.get("selected_project_id"):
-        st.session_state.selected_project_id = project_id
-        # reset soft de la saisie lors du changement de projet
-        st.session_state.form_progress_travaux = 0.0
-        st.session_state.form_progress_paiements = 0.0
-        st.session_state.form_commentaires = ""
-        st.session_state.form_date_pv = None
+    commentaires = st.text_area(
+        "Commentaires",
+        placeholder="Observations, risques, points bloquants…",
+        key="form_commentaires",
+    )
 
-    # Formulaire dans un "form" pour soumettre d’un coup
-    with st.form("form_update", clear_on_submit=False):
-        col1, col2 = st.columns(2)
-        with col1:
-            prg_t = st.number_input(
-                "Progression travaux (%)",
-                min_value=0.0,
-                max_value=100.0,
-                step=0.5,
-                value=float(st.session_state.form_progress_travaux or 0.0),
-                key="widget_prg_t",
-            )
-        with col2:
-            prg_p = st.number_input(
-                "Progression paiements (%)",
-                min_value=0.0,
-                max_value=100.0,
-                step=0.5,
-                value=float(st.session_state.form_progress_paiements or 0.0),
-                key="widget_prg_p",
-            )
+    st.subheader("Joindre le PV (PDF/DOCX/DOC)")
+    files = st.file_uploader(
+        "Drag and drop files here",
+        type=["pdf", "docx", "doc"],
+        accept_multiple_files=True,
+        label_visibility="collapsed",
+        key="form_files",
+    )
 
-        # IMPORTANT : ne pas écrire dans session_state après instanciation
-        pv_date: Optional[date] = st.date_input(
-            "Date du PV de chantier (optionnel)",
-            value=(st.session_state.form_date_pv if isinstance(st.session_state.form_date_pv, date) else None),
-            key="widget_pv_date",
-            format="YYYY/MM/DD",
+    if st.button("Enregistrer la mise à jour", type="primary"):
+        # 1) Enregistrer la ligne BDD (si RLS ok)
+        ok_row = insert_update_row(
+            sb,
+            project_id,
+            progress_travaux,
+            progress_paiements,
+            commentaires,
+            pv_date,
         )
 
-        commentaires = st.text_area(
-            "Commentaires",
-            value=st.session_state.form_commentaires or "",
-            height=140,
-            key="widget_comments",
-        )
+        # 2) Upload des fichiers
+        ok_files, msgs = upload_pv_files(sb, project_id, files, pv_date)
+        if msgs:
+            with st.expander("Détails des fichiers déposés"):
+                for m in msgs:
+                    st.write(m)
 
-        st.markdown("### Joindre le PV (PDF/DOCX/DOC)")
-        files = st.file_uploader(
-            " ",
-            accept_multiple_files=True,
-            type=["pdf", "docx", "doc"],
-            help=f"Limite {MAX_UPLOAD_MB}MB par fichier • PDF, DOCX, DOC",
-            label_visibility="collapsed",
-            key="widget_pv_files",
-        )
-
-        submit = st.form_submit_button("Enregistrer la mise à jour", use_container_width=True)
-
-    if submit:
-        # 1) insert DB
-        rec_id = insert_project_update(
-            sb=sb,
-            project_id=project_id,
-            progress_travaux=float(prg_t),
-            progress_paiements=float(prg_p),
-            commentaires=commentaires,
-            pv_date=pv_date,
-        )
-        if rec_id:
-            # 2) upload fichiers
-            uploaded = upload_pv_files(sb, project_id, files or [])
-            if uploaded:
-                st.success(f"Mise à jour enregistrée. Fichiers déposés : {uploaded}")
+        if ok_row:
+            if ok_files > 0:
+                st.success(f"Mise à jour enregistrée. Fichiers déposés : {ok_files}")
             else:
-                st.success("Mise à jour enregistrée.")
-
-            # 3) mettre à jour l’état (pour prochaine saisie)
-            st.session_state.form_progress_travaux = prg_t
-            st.session_state.form_progress_paiements = prg_p
-            st.session_state.form_commentaires = commentaires
-            st.session_state.form_date_pv = pv_date
-
-            st.experimental_rerun()
+                st.success("Mise à jour enregistrée (aucun fichier déposé).")
         else:
-            st.error("Échec d’enregistrement (voir message ci-dessus).")
+            st.warning("La ligne BDD n'a pas été enregistrée (voir message d'erreur).")
 
-    # Historique PV du projet (signé 1h)
-    pv_list = list_signed_pv(sb, project_id, SIGNED_URL_TTL)
-    render_pv_history(pv_list)
+    # Historique
+    st.markdown("---")
+    render_pv_history(sb, project_id)
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Main
-# ──────────────────────────────────────────────────────────────────────────────
+
+# ---------------- Main ----------------
 def main():
-    user = None
-    try:
-        u = sb.auth.get_user()
-        user = u.user if u else None
-    except Exception:
-        user = None
+    render_dns_banner()
+    sb = get_supabase()
 
-    st.markdown(f"Connecté : **{(user.email if user else 'non connecté')}**")
+    # Colonne gauche: Auth (compact) / droite: app
+    col_auth, col_app = st.columns([1, 2], gap="large", vertical_alignment="top")
 
-    if not user:
-        # Deux colonnes pour garder une structure claire
-        col_auth, _ = st.columns([1, 2], vertical_alignment="top")
-        with col_auth:
-            auth_panel()
-        return
+    with col_auth:
+        user = st.session_state.get("user")
+        if not user:
+            user = login_panel(sb)
+        else:
+            header_user(sb, user)
 
-    # Utilisateur connecté → formulaire
-    projects = list_projects(sb)
-    form_panel(sb, projects)
+    with col_app:
+        # si pas loggé, on bloque la suite (RLS INSERT, etc.)
+        user = st.session_state.get("user")
+        if not user:
+            st.info("Connecte-toi pour saisir une mise à jour.")
+            return
+
+        # liste projets
+        projects = list_projects(sb)
+        form_panel(sb, projects)
+
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception:
+        st.error("Une erreur est survenue.")
+        st.code(traceback.format_exc())
