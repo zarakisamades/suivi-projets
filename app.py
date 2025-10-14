@@ -1,123 +1,142 @@
-# ---------------- app.py (Partie 1/3) ----------------
-import os, socket, traceback, uuid
+# app.py
+# ─────────────────────────────────────────────────────────────────────────────
+# Suivi d’avancement — Saisie hebdomadaire (Streamlit + Supabase)
+# - Auth email/mot de passe
+# - Sélection de projet
+# - Saisie des % + commentaires + (optionnel) date PV
+# - Upload PV (PDF/DOCX/DOC) dans Storage :
+#     pv-chantier/<UUID_projet>/<YYYYMMDD>/<uuid>_<nom_fichier>
+# - Historique des PV (liens signés 1 h)
+# - Reset des champs lorsque le projet change
+# - Compatible Streamlit 1.38 (pas de experimental_rerun, pas de set_state post-widget)
+# ─────────────────────────────────────────────────────────────────────────────
+
+from __future__ import annotations
+
+import os
+import socket
+import platform
+import uuid
 from datetime import date, datetime
-from typing import List, Dict, Any, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import streamlit as st
-from supabase import create_client, Client
 
-# ---------- Etat global (doit être en tout début) ----------
-DEFAULT_STATE = {
-    "user": None,                       # dict util. supabase
-    "auth_panel_visible": True,         # afficher panneau login
-    "selected_project_id": None,        # projet sélectionné
-    "uploader_version": 0,              # reset file_uploader
-    "form_progress_travaux": None,      # float|None
-    "form_progress_paiements": None,    # float|None
-    "form_date_pv": None,               # date|None
-    "form_commentaires": "",            # str
-}
-for k, v in DEFAULT_STATE.items():
-    if k not in st.session_state:
-        st.session_state[k] = v
-
-# ---------- Config page ----------
-st.set_page_config(
-    page_title="Suivi d’avancement — Saisie hebdomadaire",
-    page_icon="📊",
-    layout="wide",
-)
-
-# ---------- Constantes ----------
+# ── Constantes appli ─────────────────────────────────────────────────────────
 BUCKET_PV = "pv-chantier"
 MAX_UPLOAD_MB = 25
 ALLOWED_EXT = {".pdf", ".docx", ".doc"}
+SIGNED_URL_TTL = 3600  # 1 heure
 
-# ---------- Utilitaires ----------
-def banner(msg: str, kind: str = "info"):
-    (st.info if kind=="info" else st.success if kind=="success" else st.warning if kind=="warning" else st.error)(msg)
+APP_TITLE = "Suivi d’avancement — Saisie"
+PAGE_ICON = "🧭"
 
-def pct_or_none(x) -> Optional[float]:
-    if x is None or x == "":
-        return None
-    try:
-        return float(str(x).replace(",", "."))
-    except Exception:
-        return None
+# ── Supabase (sync client v2) ────────────────────────────────────────────────
+# Dépendances : supabase==2.4.0 (déjà dans tes requirements)
 
-def _coerce_to_date(v) -> Optional[date]:
-    """Transforme str/datetime/date/None -> date|None (pour st.date_input)."""
-    if v is None or v == "":
-        return None
-    if isinstance(v, date) and not isinstance(v, datetime):
-        return v
-    if isinstance(v, datetime):
-        return v.date()
-    if isinstance(v, str):
-        try:
-            return date.fromisoformat(v[:10])
-        except Exception:
-            return None
-    return None
+from supabase import create_client, Client
 
-# ---------- Supabase ----------
+
 @st.cache_resource(show_spinner=False)
 def get_supabase() -> Client:
-    url = os.getenv("SUPABASE_URL") or st.secrets.get("SUPABASE_URL")
-    key = os.getenv("SUPABASE_ANON_KEY") or st.secrets.get("SUPABASE_ANON_KEY")
+    url = os.getenv("SUPABASE_URL", "").strip()
+    key = os.getenv("SUPABASE_ANON_KEY", "").strip()
     if not url or not key:
-        raise RuntimeError("SUPABASE_URL et/ou SUPABASE_ANON_KEY manquent.")
-    return create_client(url, key)
-
-sb: Client = get_supabase()
-
-def whoami(sb: Client) -> Optional[Dict[str, Any]]:
+        st.error("Variables d’environnement SUPABASE_URL / SUPABASE_ANON_KEY manquantes.")
+        st.stop()
     try:
-        info = sb.auth.get_user()
-        return info.user.model_dump() if info and info.user else None
+        return create_client(url, key)
+    except Exception as e:
+        st.error(f"Erreur création client Supabase : {e}")
+        st.stop()
+
+
+def dns_ping_from_url(url: str) -> Optional[str]:
+    try:
+        host = url.replace("https://", "").replace("http://", "").split("/")[0]
+        ip = socket.gethostbyname(host)
+        return ip
     except Exception:
         return None
 
-def list_projects(sb: Client) -> List[Dict[str, Any]]:
-    res = sb.table("projects").select("id,name").order("name").execute()
-    return res.data or []
 
-def insert_project_update(
-    sb: Client,
-    *,
-    project_id: str,
-    progress_travaux: Optional[float],
-    progress_paiements: Optional[float],
-    pv_date: Optional[date],
-    commentaires: str,
-) -> Tuple[bool, str]:
+# ── Session state par défaut (place ici, avant tout usage de st.session_state) ─
+for k, v in {
+    "user": None,                        # objet utilisateur gotrue ou None
+    "selected_project_id": None,         # UUID projet
+    "uploader_version": 0,               # pour reset file_uploader quand projet change
+    # valeurs de saisie
+    "form_progress_travaux": 0.0,
+    "form_progress_paiements": 0.0,
+    "form_commentaires": "",
+    "form_date_pv": None,                # date | None
+}.items():
+    st.session_state.setdefault(k, v)
+
+# ── Page config ──────────────────────────────────────────────────────────────
+st.set_page_config(page_title=APP_TITLE, page_icon=PAGE_ICON, layout="wide")
+
+
+# ── Fonctions métier ─────────────────────────────────────────────────────────
+def list_projects(sb: Client) -> List[Dict]:
+    """Retourne [{id,name}] triés par nom."""
     try:
-        payload = {
-            "project_id": project_id,
-            "updated_by": st.session_state["user"]["id"],
-            "progress_travaux": progress_travaux,
-            "progress_paiements": progress_paiements,
-            "pv_chantier": pv_date.isoformat() if pv_date else None,
-            "commentaires": commentaires or "",
-        }
-        payload = {k: v for k, v in payload.items() if v is not None}
-        res = sb.table("project_updates").insert(payload).execute()
-        if res.data:
-            return True, "Mise à jour enregistrée."
-        return False, "Insertion vide."
+        res = sb.table("projects").select("id,name").order("name").execute()
+        return res.data or []
     except Exception as e:
-        return False, f"Erreur enregistrement: {e}"
+        st.warning(f"Erreur lecture projets : {e}")
+        return []
 
-def upload_files(
+
+def insert_update(
     sb: Client,
     project_id: str,
-    files: List[Tuple[str, bytes]],
-) -> Tuple[int, List[str]]:
-    """files: [(filename, bytes)], retourne (nb_ok, warnings)"""
+    progress_t: float,
+    progress_p: float,
+    commentaires: str,
+    pv_date: Optional[date],
+) -> bool:
+    payload = {
+        "project_id": project_id,
+        "progress_travaux": progress_t,
+        "progress_paiements": progress_p,
+        "commentaires": commentaires,
+    }
+    if pv_date is not None:
+        payload["pv_chantier"] = pv_date.isoformat()
+    try:
+        sb.table("project_updates").insert(payload).execute()
+        return True
+    except Exception as e:
+        st.error(f"Erreur enregistrement mise à jour : {e}")
+        return False
+
+
+def _bytes_from_uploader(uploaded_files) -> List[Tuple[str, bytes]]:
+    """Transforme les UploadedFile streamlit en [(filename, bytes)]."""
+    if not uploaded_files:
+        return []
+    out: List[Tuple[str, bytes]] = []
+    for uf in uploaded_files:
+        try:
+            content = uf.read()
+            out.append((uf.name, content))
+        except Exception as e:
+            st.warning(f"{uf.name}: lecture impossible ({e})")
+    return out
+
+
+def upload_files(sb: Client, project_id: str, files: List[Tuple[str, bytes]]) -> Tuple[int, List[str]]:
+    """
+    Upload des fichiers dans:
+        pv-chantier/<project_id>/<YYYYMMDD>/<uuid>_<fname>
+    Retourne (nb_ok, warnings)
+    """
     ok = 0
     warns: List[str] = []
     today_str = datetime.utcnow().strftime("%Y%m%d")
-    base_path = f"{project_id}/{today_str}"
+    base_path = f"{project_id}/{today_str}"  # ✅ pas de duplication de dossier
+
     for fname, content in files:
         ext = os.path.splitext(fname)[1].lower()
         if ext not in ALLOWED_EXT:
@@ -130,7 +149,7 @@ def upload_files(
             path = f"{base_path}/{uuid.uuid4().hex}_{fname}"
             sb.storage.from_(BUCKET_PV).upload(
                 path=path,
-                file=content,                      # BYTES (pas BytesIO)
+                file=content,
                 file_options={"contentType": "application/octet-stream"},
             )
             ok += 1
@@ -138,226 +157,262 @@ def upload_files(
             warns.append(f"{fname}: {e}")
     return ok, warns
 
-def list_signed_pv(sb: Client, project_id: str, expires_sec: int = 3600) -> List[Dict[str, Any]]:
-    """Liste fichiers Storage pour le projet, avec URL signées."""
-    try:
-        prefix = f"{project_id}/"
-        items = sb.storage.from_(BUCKET_PV).list(path=prefix, search="")
-        if not items:
-            return []
-        paths = [f"{prefix}{it['name']}" for it in items]
-        signed = sb.storage.from_(BUCKET_PV).create_signed_urls(paths, expires_sec)
-        signed_idx = {p["path"]: p["signedURL"] for p in signed}
-        out = []
-        for it in items:
-            full = f"{prefix}{it['name']}"
-            out.append({
-                "file_name": it["name"],
-                "url": signed_idx.get(full),
-                "uploaded_at": it.get("created_at"),
-            })
-        out.sort(key=lambda x: x.get("uploaded_at") or "", reverse=True)
-        return out
-    except Exception:
-        return []
-# ---------------- fin Partie 1/3 ----------------
-# ---------------- app.py (Partie 2/3) ----------------
 
+def list_signed_pv(sb: Client, project_id: str, limit_per_day: int = 500) -> List[Dict]:
+    """
+    Récupère l’historique des PV sous forme de liens signés:
+    - parcours des dossiers dates sous <project_id>/
+    - pour chaque fichier : create_signed_url
+    Retourne: [{file_name, url, uploaded_at}]
+    """
+    results: List[Dict] = []
+    try:
+        # Liste des sous-dossiers (dates) sous <project_id>/
+        days = sb.storage.from_(BUCKET_PV).list(path=project_id)
+        for day in days or []:
+            if day.get("id") or not day.get("name"):
+                # les dossiers ont is_folder=True (SDK v2 expose 'id' vide pour dossier),
+                # mais sur certaines versions, on filtre juste par 'name' et 'metadata':
+                pass
+            day_name = day["name"]
+            # liste fichiers dans <project_id>/<YYYYMMDD>
+            files = sb.storage.from_(BUCKET_PV).list(path=f"{project_id}/{day_name}", limit=limit_per_day)
+            for f in files or []:
+                if f.get("name"):
+                    full_path = f"{project_id}/{day_name}/{f['name']}"
+                    try:
+                        signed = sb.storage.from_(BUCKET_PV).create_signed_url(full_path, SIGNED_URL_TTL)
+                        results.append(
+                            {
+                                "file_name": f["name"],
+                                "url": signed["signedURL"] if isinstance(signed, dict) else signed,
+                                "uploaded_at": f.get("created_at") or f.get("updated_at") or "",
+                            }
+                        )
+                    except Exception:
+                        # Ignore un fichier qui poserait problème pour ne pas casser l’affichage
+                        continue
+    except Exception as e:
+        st.warning(f"Erreur lecture Storage : {e}")
+        return []
+    # tri inverse (du plus récent au plus ancien)
+    results.sort(key=lambda x: x["uploaded_at"], reverse=True)
+    return results
+
+
+# ── UI : composants ──────────────────────────────────────────────────────────
 def auth_panel(sb: Client):
-    """Colonne de gauche pour l’auth. Masquée une fois connecté."""
+    """Affiche le bloc de connexion si user absent, sinon info + bouton déconnexion."""
     user = st.session_state["user"]
     if user:
-        st.write(f"Connecté : **{user.get('email', 'compte')}**")
-        if st.button("Se déconnecter"):
+        st.caption(f"Connecté : {user.get('email', '')}")
+        if st.button("Se déconnecter", type="secondary"):
             try:
                 sb.auth.sign_out()
             except Exception:
                 pass
-            # Reset état
-            for k, v in DEFAULT_STATE.items():
-                st.session_state[k] = v
+            st.session_state["user"] = None
+            # reset de la sélection projet et des champs
+            _reset_form_state(reset_project=True)
             st.rerun()
-        st.divider()
         return
 
     st.subheader("Connexion")
-    mode = st.radio("", ["Se connecter", "Créer un compte"], label_visibility="collapsed")
-    email = st.text_input("Email", key="auth_email")
-    pwd = st.text_input("Mot de passe", type="password", key="auth_pwd")
-    if st.button("Connexion" if mode=="Se connecter" else "Créer mon compte", type="primary"):
-        try:
-            if mode == "Se connecter":
-                sb.auth.sign_in_with_password({"email": email, "password": pwd})
-            else:
-                sb.auth.sign_up({"email": email, "password": pwd})
-            st.session_state["user"] = whoami(sb)
-            st.session_state["auth_panel_visible"] = False
+    email = st.text_input("Email", value="", key="auth_email")
+    pwd = st.text_input("Mot de passe", type="password", value="", key="auth_pwd")
+    colb1, colb2 = st.columns([1, 1])
+    with colb1:
+        if st.button("Connexion", type="primary", use_container_width=False):
+            try:
+                res = sb.auth.sign_in_with_password({"email": email, "password": pwd})
+                st.session_state["user"] = {"email": res.user.email, "id": res.user.id}
+                st.success("Connexion réussie.")
+                st.rerun()
+            except Exception as e:
+                st.error(f"Échec de connexion : {e}")
+    with colb2:
+        if st.button("Se déconnecter", type="secondary"):
+            try:
+                sb.auth.sign_out()
+            except Exception:
+                pass
+            st.session_state["user"] = None
+            _reset_form_state(reset_project=True)
             st.rerun()
-        except Exception as e:
-            banner(f"Echec d'authentification : {e}", "error")
 
-def _clear_form_on_project_change():
-    """Ne JAMAIS modifier une clé qui est la clé d’un widget déjà instancié !"""
-    st.session_state["form_progress_travaux"] = None
-    st.session_state["form_progress_paiements"] = None
-    st.session_state["form_date_pv"] = None
+
+def _reset_form_state(reset_project: bool = False):
+    """Réinitialise les champs de saisie (et éventuellement le projet)."""
+    if reset_project:
+        st.session_state["selected_project_id"] = None
+    st.session_state["uploader_version"] += 1  # force reset du file_uploader
+    st.session_state["form_progress_travaux"] = 0.0
+    st.session_state["form_progress_paiements"] = 0.0
     st.session_state["form_commentaires"] = ""
-    st.session_state["uploader_version"] += 1   # force le reset de l'uploader
+    st.session_state["form_date_pv"] = None
 
-def form_panel(sb: Client, projects: List[Dict[str, Any]]):
-    st.header("Suivi d’avancement — Saisie")
 
-    if not st.session_state["user"]:
-        banner("Connecte-toi pour saisir une mise à jour.", "info")
-        return
+def seleccionar_projet(sb: Client) -> Optional[str]:
+    """Selectbox des projets. Reset des champs si changement."""
+    projects = list_projects(sb)
+    if not projects:
+        st.info("Aucun projet trouvé dans la table **projects**.")
+        return None
 
-    # -------- Sélecteur projet --------
-    options = {p["name"]: p["id"] for p in projects}
-    if not options:
-        banner("Aucun projet disponible.", "warning")
-        return
-    names = list(options.keys())
-    current_name = None
-    if st.session_state["selected_project_id"]:
-        for n, pid in options.items():
-            if pid == st.session_state["selected_project_id"]:
-                current_name = n
+    id_to_name = {p["id"]: p["name"] for p in projects}
+    names = [id_to_name[p["id"]] for p in projects]
+
+    # Déterminer valeur courante (id)
+    current_id = st.session_state.get("selected_project_id", None)
+    # index sélectionné
+    index = 0
+    if current_id and current_id in id_to_name:
+        # trouver l’index correspondant
+        for i, p in enumerate(projects):
+            if p["id"] == current_id:
+                index = i
                 break
 
-    chosen_name = st.selectbox(
-        "Projet", names,
-        index=(names.index(current_name) if current_name in names else 0),
-        key="project_select_box"
-    )
-    chosen_pid = options[chosen_name]
-    if chosen_pid != st.session_state["selected_project_id"]:
-        st.session_state["selected_project_id"] = chosen_pid
-        _clear_form_on_project_change()
+    choice = st.selectbox("Projet", options=names, index=index if names else 0, key="project_selectbox")
+    # Retrouver l’id à partir du nom choisi
+    new_id = None
+    for p in projects:
+        if p["name"] == choice:
+            new_id = p["id"]
+            break
+
+    # Reset si changement de projet
+    if new_id != current_id:
+        st.session_state["selected_project_id"] = new_id
+        _reset_form_state(reset_project=False)
+        # Re-run pour rafraîchir proprement
+        st.rerun()
+
+    return st.session_state["selected_project_id"]
+
+
+def form_panel(sb: Client, project_id: Optional[str]):
+    """Bloc de saisie + upload + historique, affiché uniquement si connecté & projet choisi."""
+    if not project_id:
+        return
 
     st.subheader("Nouvelle mise à jour")
 
-    # -------- Champs de saisie --------
-    c1, c2 = st.columns(2)
-
-    with c1:
-        # clé widget ≠ clé métier -> pas de conflit
-        prog_trav = st.number_input(
-            "Progression travaux (%)", min_value=0.0, max_value=100.0, step=1.0,
-            value=st.session_state["form_progress_travaux"] if st.session_state["form_progress_travaux"] is not None else 0.0,
-            key="form_progress_travaux_widget",
+    col1, col2 = st.columns(2)
+    with col1:
+        st.number_input(
+            "Progression travaux (%)",
+            min_value=0.0,
+            max_value=100.0,
+            step=1.0,
+            key="form_progress_travaux",
+            help="Valeur entière ou décimale.",
         )
-        st.session_state["form_progress_travaux"] = prog_trav
-
-    with c2:
-        prog_pay = st.number_input(
-            "Progression paiements (%)", min_value=0.0, max_value=100.0, step=1.0,
-            value=st.session_state["form_progress_paiements"] if st.session_state["form_progress_paiements"] is not None else 0.0,
-            key="form_progress_paiements_widget",
+    with col2:
+        st.number_input(
+            "Progression paiements (%)",
+            min_value=0.0,
+            max_value=100.0,
+            step=1.0,
+            key="form_progress_paiements",
         )
-        st.session_state["form_progress_paiements"] = prog_pay
 
-    # IMPORTANT : on n’utilise PAS la même clé pour le widget et pour l’état métier
-    initial_date = _coerce_to_date(st.session_state.get("form_date_pv"))
-    date_choice = st.date_input(
-        "Date du PV de chantier (optionnel)",
-        value=initial_date,
-        key="form_date_pv_widget"   # <-- clé widget distincte
-    )
-    st.session_state["form_date_pv"] = _coerce_to_date(date_choice)
+    # Date PV (optionnelle) — on ne modifie pas la session après instanciation
+    pv_date_value: Optional[date] = st.session_state.get("form_date_pv", None)
+    # Streamlit 1.38 n’autorise pas None en value => on utilise un checkbox pour activer la date
+    use_pv_date = st.checkbox("Renseigner une date de PV de chantier", value=pv_date_value is not None)
+    if use_pv_date:
+        # Si pas encore définie, on propose aujourd’hui par défaut mais sans toucher la session
+        default_date = pv_date_value or date.today()
+        pv_date = st.date_input("Date du PV de chantier (optionnel)", value=default_date, key="form_date_pv")
+    else:
+        # Si décoché, on annule la date en session
+        st.session_state["form_date_pv"] = None
 
-    commentaires_val = st.text_area(
+    st.text_area(
         "Commentaires",
-        value=st.session_state["form_commentaires"],
-        key="form_commentaires_widget"
+        key="form_commentaires",
+        placeholder="Observations, risques, points bloquants…",
+        height=120,
     )
-    st.session_state["form_commentaires"] = commentaires_val or ""
 
     st.markdown("### Joindre le PV (PDF/DOCX/DOC)")
     uploaded = st.file_uploader(
-        "Déposer un ou plusieurs fichiers",
-        type=["pdf", "docx", "doc"],
+        "Drag and drop files here",
+        type=[e.lstrip(".") for e in ALLOWED_EXT],
         accept_multiple_files=True,
         key=f"uploader_{st.session_state['uploader_version']}",
-        label_visibility="collapsed",
+        help=f"Limite {MAX_UPLOAD_MB} Mo par fichier.",
     )
 
-    # -------- Enregistrement --------
     if st.button("Enregistrer la mise à jour", type="primary"):
-        ok, msg = insert_project_update(
+        # 1) Insert dans project_updates
+        ok_update = insert_update(
             sb,
-            project_id=st.session_state["selected_project_id"],
-            progress_travaux=pct_or_none(st.session_state["form_progress_travaux"]),
-            progress_paiements=pct_or_none(st.session_state["form_progress_paiements"]),
-            pv_date=_coerce_to_date(st.session_state["form_date_pv"]),
-            commentaires=st.session_state["form_commentaires"],
+            project_id=project_id,
+            progress_t=float(st.session_state["form_progress_travaux"] or 0),
+            progress_p=float(st.session_state["form_progress_paiements"] or 0),
+            commentaires=st.session_state["form_commentaires"] or "",
+            pv_date=st.session_state["form_date_pv"],
         )
-        (banner if ok else banner)(msg, "success" if ok else "error")
-
-        # Upload Storage
-        files_bytes: List[Tuple[str, bytes]] = []
-        if uploaded:
-            for f in uploaded:
-                try:
-                    files_bytes.append((f.name, f.getvalue()))
-                except Exception:
-                    pass
+        # 2) Upload fichiers s’il y en a
+        files_bytes = _bytes_from_uploader(uploaded)
+        uploaded_count = 0
+        warns: List[str] = []
         if files_bytes:
-            nb, warns = upload_files(sb, st.session_state["selected_project_id"], files_bytes)
-            if nb:
-                banner(f"Fichiers déposés : {nb}", "success")
-            if warns:
-                banner("Quelques fichiers n’ont pas été pris en compte :\n- " + "\n- ".join(warns), "warning")
+            uploaded_count, warns = upload_files(sb, project_id, files_bytes)
 
-        # Reset formulaire après succès
-        _clear_form_on_project_change()
+        if ok_update:
+            st.success(f"Mise à jour enregistrée. Fichiers déposés : {uploaded_count}")
+        if warns:
+            st.warning("Quelques fichiers n’ont pas été pris en compte :\n- " + "\n- ".join(warns))
+
+        # Reset des champs après enregistrement (garde le projet)
+        _reset_form_state(reset_project=False)
         st.rerun()
 
-    # -------- Liste PV --------
-    st.subheader("Pièces jointes — PV de chantier")
-    pv_list = list_signed_pv(sb, st.session_state["selected_project_id"], expires_sec=3600)
+    # ── Historique des PV (nouveau flux Storage)
+    st.markdown("### Pièces jointes — PV de chantier")
+    pv_list = list_signed_pv(sb, project_id)
     if not pv_list:
         st.info("Aucun PV pour ce projet.")
     else:
         for item in pv_list:
-            st.markdown(
-                f"- **[{item['file_name']}]({item['url']})**"
-                + (f"  \n  _Uploadé le : {item.get('uploaded_at','')}_"
-                   if item.get('uploaded_at') else ""),
-                unsafe_allow_html=True
-            )
-# ---------------- fin Partie 2/3 ----------------
-# ---------------- app.py (Partie 3/3) ----------------
+            nom = item["file_name"]
+            url = item["url"]
+            up_at = item.get("uploaded_at", "")
+            st.markdown(f"- **[{nom}]({url})** — _ajouté le {up_at}_", unsafe_allow_html=True)
 
-def dns_banner():
-    """Petit test réseau/DNS vers Supabase (optionnel)."""
-    try:
-        url = (os.getenv("SUPABASE_URL") or st.secrets.get("SUPABASE_URL", "")).strip()
-        host = url.split("://", 1)[-1].split("/", 1)[0]
-        ip = socket.gethostbyname(host)
-        st.caption(f"Connexion réseau Supabase OK (status attendu: 401) — DNS {host} → {ip}")
-    except Exception as e:
-        st.caption(f"DNS Supabase: {e}")
 
+# ── Main ─────────────────────────────────────────────────────────────────────
 def main():
-    dns_banner()
-    # rafraîchir user actuel
-    st.session_state["user"] = whoami(sb)
+    sb = get_supabase()
 
-    # Layout : si connecté et panneau masqué -> 1 colonne large ; sinon 2 colonnes
-    if st.session_state["user"] and not st.session_state["auth_panel_visible"]:
-        # pas de colonne auth
-        form_panel(sb, list_projects(sb))
-    else:
-        col_auth, col_app = st.columns([1, 2], gap="large")
-        with col_auth:
-            auth_panel(sb)
-        with col_app:
-            form_panel(sb, list_projects(sb))
+    # Bandeau santé réseau
+    host_ip = dns_ping_from_url(sb.rest_url if hasattr(sb, "rest_url") else os.getenv("SUPABASE_URL", ""))
+    st.success(
+        f"Connexion réseau Supabase OK (status attendu: 401) — DNS {os.getenv('SUPABASE_URL','').replace('https://','').split('/')[0]} "
+        + (f"→ {host_ip}" if host_ip else "")
+    )
+
+    # Une seule colonne (pas de panneau latéral encombrant)
+    # Auth (en haut) + app dessous
+    auth_panel(sb)
+
+    # Si pas connecté, on n’affiche pas la suite
+    if not st.session_state["user"]:
+        return
+
+    st.title(APP_TITLE)
+
+    # Sélection du projet
+    project_id = seleccionar_projet(sb)
+    if not project_id:
+        return
+
+    # Formulaire & historique
+    form_panel(sb, project_id)
+
 
 if __name__ == "__main__":
-    try:
-        main()
-    except Exception:
-        st.error("Une erreur est survenue. Détails dans les logs.")
-        st.exception(traceback.format_exc())
-# ---------------- fin Partie 3/3 ----------------
+    main()
