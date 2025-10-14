@@ -121,6 +121,14 @@ def _bytes_from_uploader(uploaded_files) -> List[Tuple[str, bytes]]:
     return out
 
 
+def _content_type_for(ext: str) -> str:
+    return {
+        ".pdf": "application/pdf",
+        ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        ".doc": "application/msword",
+    }.get(ext.lower(), "application/octet-stream")
+
+
 def upload_files(sb: Client, project_id: str, files: List[Tuple[str, bytes]]) -> Tuple[int, List[str]]:
     ok = 0
     warns: List[str] = []
@@ -140,7 +148,7 @@ def upload_files(sb: Client, project_id: str, files: List[Tuple[str, bytes]]) ->
             sb.storage.from_(BUCKET_PV).upload(
                 path=path,
                 file=content,
-                file_options={"contentType": "application/octet-stream"},
+                file_options={"contentType": _content_type_for(ext)},
             )
             ok += 1
         except Exception as e:
@@ -149,15 +157,27 @@ def upload_files(sb: Client, project_id: str, files: List[Tuple[str, bytes]]) ->
 
 
 def list_signed_pv(sb: Client, project_id: str, limit_per_day: int = 500) -> List[Dict]:
+    """Retourne la liste des fichiers PV (signés) triés du plus récent au plus ancien.
+
+    ⚠️ supabase-py 2.x : storage.list(path, options={...})
+    """
     results: List[Dict] = []
     try:
-        # Liste dossiers jours
-        days = sb.storage.from_(BUCKET_PV).list(path=project_id)
+        # 1) Lister les sous-dossiers (jours) du projet
+        days = sb.storage.from_(BUCKET_PV).list(
+            path=project_id,
+            options={"limit": 1000, "sortBy": {"column": "name", "order": "desc"}},
+        )
         for day in days or []:
             day_name = day.get("name")
             if not day_name:
                 continue
-            files = sb.storage.from_(BUCKET_PV).list(path=f"{project_id}/{day_name}", limit=limit_per_day)
+
+            # 2) Lister les fichiers du jour
+            files = sb.storage.from_(BUCKET_PV).list(
+                path=f"{project_id}/{day_name}",
+                options={"limit": limit_per_day, "sortBy": {"column": "name", "order": "desc"}},
+            )
             for f in files or []:
                 fname = f.get("name")
                 if not fname:
@@ -178,6 +198,7 @@ def list_signed_pv(sb: Client, project_id: str, limit_per_day: int = 500) -> Lis
     except Exception as e:
         st.warning(f"Erreur lecture Storage : {e}")
         return []
+    # Tri décroissant par date si dispo
     results.sort(key=lambda x: x["uploaded_at"], reverse=True)
     return results
 
