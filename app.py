@@ -6,12 +6,13 @@ import socket
 import uuid
 from datetime import date, datetime
 from typing import Dict, List, Optional, Tuple
+from collections import defaultdict
 
 import streamlit as st
 from supabase import create_client, Client
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Constantes appli
+# Configuration & constantes
 # ─────────────────────────────────────────────────────────────────────────────
 APP_TITLE = "Suivi d’avancement — Saisie"
 PAGE_ICON = "🧭"
@@ -19,10 +20,10 @@ PAGE_ICON = "🧭"
 BUCKET_PV = "pv-chantier"
 MAX_UPLOAD_MB = 25
 ALLOWED_EXT = {".pdf", ".docx", ".doc"}
-SIGNED_URL_TTL = 3600  # 1h
+SIGNED_URL_TTL = 3600  # secondes (ex: 3600 = 1h, 86400 = 24h)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Client Supabase
+# Client Supabase (v2.x sync)
 # ─────────────────────────────────────────────────────────────────────────────
 @st.cache_resource(show_spinner=False)
 def get_supabase() -> Client:
@@ -43,7 +44,7 @@ def dns_ping_from_url(url: str) -> Optional[str]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Session state par défaut (défini AVANT tout widget)
+# Session State (défini AVANT tout widget) + reset différé
 # ─────────────────────────────────────────────────────────────────────────────
 for k, v in {
     "user": None,                        # {"email":..., "id":...} ou None
@@ -55,11 +56,11 @@ for k, v in {
     "form_date_pv": None,                # date | None
     # flags techniques
     "__reset_after_save": False,
-    "__flash": None,                     # dict {"ok":bool,"uploaded":int,"warns":[...]}
+    "__flash": None,                     # dict {"ok":bool,"uploaded":int,"warns":[...],"msg":str|None}
 }.items():
     st.session_state.setdefault(k, v)
 
-# Si le précédent run a demandé un reset, on le fait ICI (avant création des widgets)
+# Si le précédent run a demandé un reset, on le fait ici (avant création des widgets)
 if st.session_state.get("__reset_after_save"):
     st.session_state["uploader_version"] += 1
     st.session_state["form_progress_travaux"] = 0.0
@@ -69,7 +70,7 @@ if st.session_state.get("__reset_after_save"):
     st.session_state["__reset_after_save"] = False
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Config page
+# Mise en page
 # ─────────────────────────────────────────────────────────────────────────────
 st.set_page_config(page_title=APP_TITLE, page_icon=PAGE_ICON, layout="wide")
 
@@ -95,9 +96,12 @@ def insert_update(
     commentaires: str,
     pv_date: Optional[date],
 ) -> Tuple[bool, Optional[str]]:
+    """
+    Insert dans project_updates en respectant RLS (updated_by = auth.uid()).
+    """
     payload = {
         "project_id": project_id,
-        "updated_by": user_id,  # ✅ important pour RLS (updated_by = auth.uid())
+        "updated_by": user_id,  # ✅ nécessaire pour policy INSERT
         "progress_travaux": progress_t,
         "progress_paiements": progress_p,
         "commentaires": commentaires,
@@ -130,10 +134,13 @@ def _content_type_for(ext: str) -> str:
 
 
 def upload_files(sb: Client, project_id: str, files: List[Tuple[str, bytes]]) -> Tuple[int, List[str]]:
+    """
+    Upload dans: pv-chantier/<project_id>/<YYYYMMDD>/<uuid>_<nom_fichier>
+    """
     ok = 0
     warns: List[str] = []
     today_str = datetime.utcnow().strftime("%Y%m%d")
-    base_path = f"{project_id}/{today_str}"
+    base_path = f"{project_id}/{today_str}"  # pas de duplication de dossier
 
     for fname, content in files:
         ext = os.path.splitext(fname)[1].lower()
@@ -157,13 +164,14 @@ def upload_files(sb: Client, project_id: str, files: List[Tuple[str, bytes]]) ->
 
 
 def list_signed_pv(sb: Client, project_id: str, limit_per_day: int = 500) -> List[Dict]:
-    """Retourne la liste des fichiers PV (signés) triés du plus récent au plus ancien.
-
-    ⚠️ supabase-py 2.x : storage.list(path, options={...})
+    """
+    Retourne la liste des PV avec liens signés, en parcourant:
+        pv-chantier/<project_id>/<YYYYMMDD>/*.*
+    ⚠️ supabase-py 2.x : options passées via dict dans storage.list(...)
     """
     results: List[Dict] = []
     try:
-        # 1) Lister les sous-dossiers (jours) du projet
+        # Lister les sous-dossiers (jours)
         days = sb.storage.from_(BUCKET_PV).list(
             path=project_id,
             options={"limit": 1000, "sortBy": {"column": "name", "order": "desc"}},
@@ -173,7 +181,7 @@ def list_signed_pv(sb: Client, project_id: str, limit_per_day: int = 500) -> Lis
             if not day_name:
                 continue
 
-            # 2) Lister les fichiers du jour
+            # Lister les fichiers de ce jour
             files = sb.storage.from_(BUCKET_PV).list(
                 path=f"{project_id}/{day_name}",
                 options={"limit": limit_per_day, "sortBy": {"column": "name", "order": "desc"}},
@@ -191,6 +199,7 @@ def list_signed_pv(sb: Client, project_id: str, limit_per_day: int = 500) -> Lis
                             "file_name": fname,
                             "url": url,
                             "uploaded_at": f.get("created_at") or f.get("updated_at") or "",
+                            "day_folder": day_name,
                         }
                     )
                 except Exception:
@@ -198,14 +207,36 @@ def list_signed_pv(sb: Client, project_id: str, limit_per_day: int = 500) -> Lis
     except Exception as e:
         st.warning(f"Erreur lecture Storage : {e}")
         return []
-    # Tri décroissant par date si dispo
-    results.sort(key=lambda x: x["uploaded_at"], reverse=True)
+    # tri décroissant par date d’upload si dispo, sinon par dossier de jour
+    results.sort(key=lambda x: (x.get("uploaded_at") or "", x.get("day_folder") or "", x["file_name"]), reverse=True)
     return results
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# UI
+# Rendu UI
 # ─────────────────────────────────────────────────────────────────────────────
+def render_pv_list_grouped(pv_list: List[Dict]):
+    """
+    Affiche l’historique groupé par jour (YYYY-MM-DD si possible),
+    sinon par nom de dossier jour (YYYYMMDD).
+    """
+    by_day = defaultdict(list)
+    for item in pv_list:
+        iso = item.get("uploaded_at") or ""
+        # uploaded_at vient souvent au format ISO8601 Z
+        try:
+            d = datetime.fromisoformat(iso.replace("Z", "")).date().isoformat()
+        except Exception:
+            # fallback : utilise le nom de dossier tel quel (YYYYMMDD)
+            d = item.get("day_folder") or "Date inconnue"
+        by_day[d].append(item)
+
+    for d in sorted(by_day.keys(), reverse=True):
+        st.markdown(f"#### {d}")
+        for it in by_day[d]:
+            st.markdown(f"- **[{it['file_name']}]({it['url']})**", unsafe_allow_html=True)
+
+
 def auth_panel(sb: Client):
     user = st.session_state["user"]
     if user:
@@ -235,6 +266,10 @@ def auth_panel(sb: Client):
 
 
 def seleccionar_projet(sb: Client) -> Optional[str]:
+    """
+    Selectbox des projets.
+    Reset des champs si changement (via flag + rerun).
+    """
     projects = list_projects(sb)
     if not projects:
         st.info("Aucun projet trouvé dans la table **projects**.")
@@ -271,7 +306,7 @@ def form_panel(sb: Client, project_id: Optional[str]):
     if not project_id:
         return
 
-    # Afficher éventuel flash (résultat du run précédent) AVANT widgets
+    # Affiche le flash (résultat précédent) AVANT les widgets
     flash = st.session_state.get("__flash")
     if flash:
         if flash.get("ok"):
@@ -323,7 +358,7 @@ def form_panel(sb: Client, project_id: Optional[str]):
 
     st.markdown("### Joindre le PV (PDF/DOCX/DOC)")
     uploaded = st.file_uploader(
-        "Drag and drop files here",
+        "Glisser-déposer les fichiers ici",
         type=[e.lstrip(".") for e in ALLOWED_EXT],
         accept_multiple_files=True,
         key=f"uploader_{st.session_state['uploader_version']}",
@@ -331,11 +366,11 @@ def form_panel(sb: Client, project_id: Optional[str]):
     )
 
     if st.button("Enregistrer la mise à jour", type="primary"):
-        # 1) Insert
+        # 1) Insert (RLS)
         ok_update, err_msg = insert_update(
             sb,
             project_id=project_id,
-            user_id=st.session_state["user"]["id"],  # ✅ pour RLS
+            user_id=st.session_state["user"]["id"],  # ✅ pour RLS (updated_by = auth.uid())
             progress_t=float(st.session_state["form_progress_travaux"] or 0),
             progress_p=float(st.session_state["form_progress_paiements"] or 0),
             commentaires=st.session_state["form_commentaires"] or "",
@@ -349,7 +384,7 @@ def form_panel(sb: Client, project_id: Optional[str]):
             if files_bytes:
                 uploaded_count, warns = upload_files(sb, project_id, files_bytes)
 
-        # préparer un flash pour l’afficher au prochain run
+        # flash pour l’afficher au prochain run
         st.session_state["__flash"] = {
             "ok": ok_update,
             "uploaded": uploaded_count,
@@ -360,17 +395,13 @@ def form_panel(sb: Client, project_id: Optional[str]):
         st.session_state["__reset_after_save"] = bool(ok_update)
         st.rerun()
 
-    # Historique Storage
+    # ── Historique PV groupé par jour ────────────────────────────────────────
     st.markdown("### Pièces jointes — PV de chantier")
     pv_list = list_signed_pv(sb, project_id)
     if not pv_list:
         st.info("Aucun PV pour ce projet.")
     else:
-        for item in pv_list:
-            st.markdown(
-                f"- **[{item['file_name']}]({item['url']})** — _ajouté le {item.get('uploaded_at','')}_",
-                unsafe_allow_html=True,
-            )
+        render_pv_list_grouped(pv_list)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -379,7 +410,7 @@ def form_panel(sb: Client, project_id: Optional[str]):
 def main():
     sb = get_supabase()
 
-    # Bandeau diagnostic réseau
+    # Bandeau diagnostic réseau (optionnel)
     ip = dns_ping_from_url(os.getenv("SUPABASE_URL", ""))
     st.success(
         f"Connexion réseau Supabase OK (status attendu: 401) — DNS "
@@ -394,12 +425,12 @@ def main():
 
     st.title(APP_TITLE)
 
-    # Projet
+    # Sélection projet
     project_id = seleccionar_projet(sb)
     if not project_id:
         return
 
-    # Formulaire
+    # Formulaire + Historique
     form_panel(sb, project_id)
 
 
