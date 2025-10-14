@@ -1,4 +1,4 @@
-# app.py — Partie 1/2
+# app.py — Variante avec journal dans la table pv_files (Partie 1/2)
 
 import os
 import socket
@@ -129,12 +129,10 @@ def list_projects(sb: Client) -> List[Dict]:
 
 # ---------------- Fichiers / Storage ----------------
 def _safe_filename(original_name: str) -> str:
-    # Normalise le nom pour éviter caractères problématiques
     base = os.path.basename(original_name or "").replace(" ", "_")
     base = "".join(c for c in base if c.isalnum() or c in ("_", "-", ".", "(", ")"))
     if not base:
         base = "document"
-    # préfix UUID pour éviter les collisions
     return f"{uuid.uuid4().hex}_{base}"
 
 
@@ -143,14 +141,43 @@ def _content_type_from_name(name: str) -> str:
     return ct or "application/octet-stream"
 
 
+def get_public_url(sb: Client, obj_path: str) -> str:
+    """Retourne l’URL publique permanente (bucket public requis)."""
+    pub = sb.storage.from_(BUCKET_PV).get_public_url(obj_path)
+    return pub.get("publicURL") or pub.get("public_url") or ""
+
+
+def log_pv_file(
+    sb: Client,
+    project_id: str,
+    file_name: str,
+    obj_path: str,
+    public_url: str,
+    pv_date: Optional[date],
+    uploaded_by: Optional[str],
+) -> None:
+    """Insère une ligne de journal dans pv_files."""
+    row = {
+        "project_id": project_id,
+        "file_path": obj_path,
+        "file_name": file_name,
+        "public_url": public_url,
+        "pv_date": pv_date.isoformat() if pv_date else None,
+        "uploaded_by": uploaded_by,
+    }
+    sb.table("pv_files").insert(row).execute()
+
+
 def upload_pv_files(
     sb: Client,
     project_id: str,
     files: List["UploadedFile"],
     pv_date: Optional[date],
+    uploaded_by: Optional[str],
 ) -> Tuple[int, List[str]]:
     """
     Upload les fichiers vers: pv-chantier/<project_id>/<YYYYMMDD>/<filename>
+    Journalise chaque upload dans la table pv_files.
     Retourne: (nb_upload_ok, messages)
     """
     msgs: List[str] = []
@@ -180,242 +207,23 @@ def upload_pv_files(
                 data,
                 file_options={"content-type": ctype, "upsert": False},
             )
+            public_url = get_public_url(sb, obj_path)
+            try:
+                log_pv_file(
+                    sb,
+                    project_id=project_id,
+                    file_name=safe_name,
+                    obj_path=obj_path,
+                    public_url=public_url,
+                    pv_date=pv_date,
+                    uploaded_by=uploaded_by,
+                )
+            except Exception as e_log:
+                msgs.append(f"⚠️ Journalisation pv_files échouée: {e_log}")
+
             msgs.append(f"✅ {f.name} déposé.")
             ok_count += 1
         except Exception as e:
             msgs.append(f"⚠️ {f.name} : upload échoué ({e})")
 
     return ok_count, msgs
-
-
-def list_public_pv(sb: Client, project_id: str) -> List[Dict]:
-    """
-    Liste tous les PV pour un projet, renvoie:
-    { 'date_folder': 'YYYYMMDD', 'file_name': 'xx.pdf', 'url': '<public-url>', 'uploaded_at': ISO }
-    ATTENTION: bucket public requis (policy de lecture).
-    """
-    store = sb.storage.from_(BUCKET_PV)
-    out: List[Dict] = []
-
-    try:
-        # 1) lister les dossiers dates : <project_id>/
-        # la SDK retourne dossiers + fichiers; on va filtrer
-        entries = store.list(project_id)
-    except Exception as e:
-        st.error(f"Erreur lecture Storage (racine projet): {e}")
-        return out
-
-    # Sous-dossiers = dates (heuristique: item sans 'id' ou avec 'metadata' vide, et / pas dans le nom)
-    date_folders = [it["name"] for it in entries if "/" not in it.get("name", "")]
-    # tri desc
-    date_folders.sort(reverse=True)
-
-    for folder in date_folders:
-        prefix = f"{project_id}/{folder}"
-        try:
-            files = store.list(prefix)
-        except Exception as e:
-            st.warning(f"Erreur lecture Storage ({prefix}) : {e}")
-            continue
-
-        for item in files:
-            name = item.get("name", "")
-            if not name:
-                continue
-            obj_path = f"{prefix}/{name}"
-            # URL publique permanente :
-            pub = store.get_public_url(obj_path)
-            url = pub.get("publicURL") or pub.get("public_url") or ""
-            uploaded_at = (
-                item.get("updated_at")
-                or item.get("created_at")
-                or datetime.utcnow().isoformat()
-            )
-            out.append(
-                {
-                    "date_folder": folder,
-                    "file_name": name,
-                    "url": url,
-                    "uploaded_at": uploaded_at,
-                }
-            )
-
-    # déjà trié par dossiers desc; on peut raffiner par uploaded_at si besoin
-    return out
-# app.py — Partie 2/2
-
-# ---------------- Rendu Historique ----------------
-def render_pv_history(sb: Client, project_id: Optional[str]):
-    st.subheader("Pièces jointes — PV de chantier")
-    if not project_id:
-        st.info("Sélectionne un projet pour voir les PV.")
-        return
-
-    items = list_public_pv(sb, project_id)
-    if not items:
-        st.info("Aucun PV pour ce projet.")
-        return
-
-    # Groupement par date_folder
-    by_date: Dict[str, List[Dict]] = {}
-    for it in items:
-        by_date.setdefault(it["date_folder"], []).append(it)
-
-    # Affichage propre
-    for d in sorted(by_date.keys(), reverse=True):
-        st.markdown(f"### {d[:4]}-{d[4:6]}-{d[6:]}")
-        for it in by_date[d]:
-            nice_name = it["file_name"]
-            url = it["url"]
-            when = it["uploaded_at"]
-            st.markdown(f"- [{nice_name}]({url}) — ajouté le `{when}`")
-
-
-# ---------------- Enregistrement BDD ----------------
-def insert_update_row(
-    sb: Client,
-    project_id: str,
-    progress_travaux: float,
-    progress_paiements: float,
-    commentaires: str,
-    pv_date: Optional[date],
-) -> bool:
-    """Insère une ligne dans project_updates (RLS doit permettre INSERT par l'utilisateur connecté)."""
-    row = {
-        "project_id": project_id,
-        "progress_travaux": progress_travaux,
-        "progress_paiments": progress_paiements,  # si ta colonne s'appelle progress_paiements, corrige ici
-        "commentaires": commentaires,
-        "pv_chantier": pv_date.isoformat() if pv_date else None,
-    }
-    try:
-        sb.table("project_updates").insert(row).execute()
-        return True
-    except Exception as e:
-        st.error(f"Erreur enregistrement mise à jour : {e}")
-        return False
-
-
-# ---------------- Panneau Formulaire ----------------
-def form_panel(sb: Client, projects: List[Dict]):
-    st.header("Suivi d’avancement — Saisie")
-
-    if not projects:
-        st.info("Aucun projet disponible.")
-        return
-
-    # Sélecteur projet
-    project_names = [p["name"] for p in projects]
-    project_ids = {p["name"]: p["id"] for p in projects}
-
-    sel_name = st.selectbox("Projet", project_names, key="sel_project_name")
-    project_id = project_ids.get(sel_name)
-
-    st.subheader("Nouvelle mise à jour")
-
-    # Champs de saisie
-    col1, col2 = st.columns(2)
-    with col1:
-        progress_travaux = st.number_input(
-            "Progression travaux (%)",
-            min_value=0.0,
-            max_value=100.0,
-            step=1.0,
-            value=0.0,
-            key="form_progress_travaux",
-        )
-    with col2:
-        progress_paiements = st.number_input(
-            "Progression paiements (%)",
-            min_value=0.0,
-            max_value=100.0,
-            step=1.0,
-            value=0.0,
-            key="form_progress_paiements",
-        )
-
-    pv_date: Optional[date] = st.date_input(
-        "Date du PV de chantier (optionnel)",
-        value=None,
-        format="YYYY/MM/DD",
-        key="form_date_pv",
-    )
-    commentaires = st.text_area(
-        "Commentaires",
-        placeholder="Observations, risques, points bloquants…",
-        key="form_commentaires",
-    )
-
-    st.subheader("Joindre le PV (PDF/DOCX/DOC)")
-    files = st.file_uploader(
-        "Drag and drop files here",
-        type=["pdf", "docx", "doc"],
-        accept_multiple_files=True,
-        label_visibility="collapsed",
-        key="form_files",
-    )
-
-    if st.button("Enregistrer la mise à jour", type="primary"):
-        # 1) Enregistrer la ligne BDD (si RLS ok)
-        ok_row = insert_update_row(
-            sb,
-            project_id,
-            progress_travaux,
-            progress_paiements,
-            commentaires,
-            pv_date,
-        )
-
-        # 2) Upload des fichiers
-        ok_files, msgs = upload_pv_files(sb, project_id, files, pv_date)
-        if msgs:
-            with st.expander("Détails des fichiers déposés"):
-                for m in msgs:
-                    st.write(m)
-
-        if ok_row:
-            if ok_files > 0:
-                st.success(f"Mise à jour enregistrée. Fichiers déposés : {ok_files}")
-            else:
-                st.success("Mise à jour enregistrée (aucun fichier déposé).")
-        else:
-            st.warning("La ligne BDD n'a pas été enregistrée (voir message d'erreur).")
-
-    # Historique
-    st.markdown("---")
-    render_pv_history(sb, project_id)
-
-
-# ---------------- Main ----------------
-def main():
-    render_dns_banner()
-    sb = get_supabase()
-
-    # Colonne gauche: Auth (compact) / droite: app
-    col_auth, col_app = st.columns([1, 2], gap="large", vertical_alignment="top")
-
-    with col_auth:
-        user = st.session_state.get("user")
-        if not user:
-            user = login_panel(sb)
-        else:
-            header_user(sb, user)
-
-    with col_app:
-        # si pas loggé, on bloque la suite (RLS INSERT, etc.)
-        user = st.session_state.get("user")
-        if not user:
-            st.info("Connecte-toi pour saisir une mise à jour.")
-            return
-
-        # liste projets
-        projects = list_projects(sb)
-        form_panel(sb, projects)
-
-
-if __name__ == "__main__":
-    try:
-        main()
-    except Exception:
-        st.error("Une erreur est survenue.")
-        st.code(traceback.format_exc())
