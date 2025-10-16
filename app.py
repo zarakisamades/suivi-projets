@@ -167,7 +167,7 @@ def list_projects(sb: Client) -> List[Dict]:
 
 # ------------- Upload PV -------------
 def upload_pv_files(
-    sb: Client, project_id: str, the_date: date, files: List[Dict], bucket: str = BUCKET_PV
+    sb: Client, project_id: str, the_date: date, files: List[object], bucket: str = BUCKET_PV
 ) -> Tuple[int, List[Dict]]:
     ok = 0
     rows = []
@@ -175,7 +175,7 @@ def upload_pv_files(
         return ok, rows
     from_ = sb.storage.from_(bucket)
     for f in files:
-        name = f.name
+        name = getattr(f, "name", "file")
         if not any(name.lower().endswith(ext) for ext in ALLOWED_EXT):
             st.warning(f"Fichier ignoré (extension non autorisée) : {name}")
             continue
@@ -259,7 +259,8 @@ def form_panel(sb: Client, projects: List[Dict]):
     project_id = next((p["id"] for p in projects if p["name"] == project_name), projects[0]["id"])
     st.session_state["selected_project_id"] = project_id
 
-    with st.form("update_form", clear_on_submit=False, enter_to_submit=False):
+    # ⚠️ Ne pas utiliser enter_to_submit (non supporté dans ta version)
+    with st.form("update_form", clear_on_submit=False):
         col1, col2 = st.columns(2)
         with col1:
             val_travaux = st.number_input("Progression travaux (%)", min_value=0.0, max_value=100.0, step=1.0, value=0.0)
